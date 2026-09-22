@@ -61,7 +61,9 @@ const ids = ['rowsInput', 'colsInput', 'createGridBtn', 'axisSelect', 'lineSelec
   'duplexOverlay', 'duplexFlipOverlay', 'duplexScreenNote', 'duplexPrintBtn',
   'duplexCloseBtn', 'plateFrontMeta', 'plateBackMeta', 'plateFrontSheet',
   'plateBackSheet',
-  'auditCard', 'auditVerdict', 'auditStatus', 'auditFindings', 'auditExportBtn'];
+  'auditCard', 'auditVerdict', 'auditStatus', 'auditFindings', 'auditExportBtn',
+  'creepCard', 'creepThickness', 'creepBleed', 'creepApplyBtn', 'creepClearBtn',
+  'creepStatus', 'creepSummary', 'creepApplied', 'creepTableWrap', 'creepRows'];
 const els = Object.fromEntries(ids.map((id) => [id, makeEl(id)]));
 els.rowsInput.value = '2';
 els.colsInput.value = '2';
@@ -69,6 +71,8 @@ els.planName.value = '冒烟方案';
 els.axisSelect.value = 'v';
 els.duplexFlip.value = 'long';
 els.duplexFlipOverlay.value = 'long';
+els.creepThickness.value = '0.1';
+els.creepBleed.value = '3';
 
 const foldBtns = ['l', 'r', 'u', 'd'].map((dir) => {
   const b = makeEl('fold-' + dir);
@@ -478,5 +482,137 @@ assert.equal(els.auditFindings.hidden, true, '中止时不展示结论列表');
 ui.plan.steps.pop();
 ui.render();
 assert.equal(ui.audit.result.ok, true);
+
+// ---------- 书帖爬移补偿 ----------
+// 未创建网格时禁用
+els.rowsInput.value = '0'; els.colsInput.value = '2';
+// rows 不接受 0（createGrid 钳制到 1）；改用未收成单叠场景验证禁用原因
+els.rowsInput.value = '2'; els.colsInput.value = '3';
+els.createGridBtn.dispatch('click');
+ui.requestStep({ axis: 'v', line: 1, dir: 'r' });
+assert.equal(els.creepApplyBtn.disabled, true);
+assert.ok(/尚未收成单叠/.test(els.creepStatus.textContent));
+assert.equal(els.creepTableWrap.hidden, true);
+
+// 非法折叠时禁用并说明
+ui.plan.steps.push({ axis: 'v', line: 2, dir: 'l' });
+ui.renderCreep();
+assert.equal(els.creepApplyBtn.disabled, true);
+assert.ok(/非法折叠/.test(els.creepStatus.textContent));
+ui.plan.steps.pop();
+
+// 合法 2×2 折帖：逐叶明细、最大补偿 0.3，均可应用
+els.rowsInput.value = '2'; els.colsInput.value = '2';
+els.createGridBtn.dispatch('click');
+ui.requestStep({ axis: 'v', line: 1, dir: 'r' });
+ui.requestStep({ axis: 'h', line: 1, dir: 'd' });
+els.creepThickness.value = '0.1';
+els.creepBleed.value = '3';
+
+// 捕获 #creepRows 动态 appendChild 的行节点（桩默认 appendChild 为空操作）
+const creepTableRowSnapshots = () => (els.creepRows.__children || [])
+  .map((tr) => ({ className: tr.className, textContent: tr.textContent }));
+els.creepRows.__children = [];
+els.creepRows.appendChild = (tr) => { els.creepRows.__children.push(tr); };
+// app.js 每次重渲染先 tbody.innerHTML=''：让 innerHTML setter 顺带清空捕获
+const desc = Object.getOwnPropertyDescriptor(els.creepRows, 'innerHTML');
+Object.defineProperty(els.creepRows, 'innerHTML', {
+  configurable: true,
+  get: desc.get,
+  set(v) { desc.set.call(els.creepRows, v); els.creepRows.__children = []; }
+});
+ui.renderCreep();
+assert.ok(ui.creep.result && ui.creep.result.ok);
+assert.equal(ui.creep.result.leafCount, 4);
+assert.equal(ui.creep.result.maxCompensation, 0.3);
+assert.deepEqual(ui.creep.result.leaves.map((l) => l.creep), [0, 0.1, 0.2, 0.3]);
+assert.equal(els.creepApplyBtn.disabled, false);
+assert.equal(els.creepTableWrap.hidden, false);
+assert.ok(/书脊/.test(els.creepSummary.textContent));
+// 逐叶明细 4 行已挂入表体，且行 class 包含层序/中缝标记
+{
+  const rows = creepTableRowSnapshots();
+  assert.equal(rows.length, 4);
+  assert.ok(rows[0].className.includes('leaf-cover'));
+  assert.ok(rows[3].className.includes('leaf-center'));
+  assert.ok(rows.every((r) => /格\(/.test(r.textContent)));
+  assert.ok(rows[3].textContent.includes('0.3'));
+}
+
+// 参数输入实时重算：纸厚变化 -> 最大补偿变化
+els.creepThickness.dispatch('input');
+els.creepThickness.value = '0.2';
+ui.renderCreep();
+assert.equal(ui.creep.result.maxCompensation, 0.6);
+
+// 出血不足：标红对应原始纸格两面并禁用应用
+els.creepBleed.value = '0.05';
+ui.renderCreep();
+assert.equal(ui.creep.result.canApply, false);
+assert.equal(els.creepApplyBtn.disabled, true);
+assert.ok(/超过可用出血/.test(els.creepStatus.textContent));
+{
+  // 补偿 0.1/0.2/0.3 的内三叶均超 0.05：对应行带 creep-over 标红 class，最外叶不标
+  const rows = creepTableRowSnapshots();
+  assert.equal(rows.filter((r) => r.className.includes('creep-over')).length, 3);
+  assert.ok(!rows[0].className.includes('creep-over'));
+  assert.ok(rows.some((r) => /超出血/.test(r.textContent)));
+}
+
+// 参数非法：禁用并提示
+els.creepThickness.value = '-1';
+ui.renderCreep();
+assert.equal(els.creepApplyBtn.disabled, true);
+assert.ok(/禁用应用/.test(els.creepStatus.textContent));
+
+// 恢复合法参数后应用：写入独立方案字段，清除按钮出现
+els.creepThickness.value = '0.1';
+els.creepBleed.value = '3';
+ui.renderCreep();
+assert.equal(els.creepApplyBtn.disabled, false);
+els.creepApplyBtn.dispatch('click');
+assert.ok(ui.plan.creepCompensation, '应用后应写入 creepCompensation 独立字段');
+assert.equal(ui.plan.creepCompensation.params.paperThickness, 0.1);
+assert.equal(ui.plan.creepCompensation.params.bleed, 3);
+assert.equal(ui.plan.creepCompensation.maxCompensation, 0.3);
+assert.deepEqual(Object.keys(ui.plan.creepCompensation.faces).sort(),
+  ['0,0', '0,1', '1,0', '1,1']);
+assert.equal(els.creepClearBtn.hidden, false);
+assert.ok(/已应用/.test(els.creepApplied.textContent));
+assert.ok(ui.plan.creepCompensation.basis.stepsSignature.length > 0);
+
+// 保存载荷含独立字段
+assert.ok(JSON.stringify(ui.plan).includes('creepCompensation'));
+
+// 应用后参数变化：字段保留但提示过期，实时明细仍重算
+els.creepThickness.value = '0.15';
+ui.renderCreep();
+assert.ok(ui.plan.creepCompensation, '过期不清空已应用字段');
+assert.ok(/不一致/.test(els.creepApplied.textContent), '过期应标黄提示重新应用');
+
+// 清除：删除独立字段
+els.creepThickness.value = '0.1';
+ui.renderCreep();
+els.creepClearBtn.dispatch('click');
+assert.equal(ui.plan.creepCompensation, undefined);
+assert.equal(els.creepClearBtn.hidden, true);
+
+// 导入含爬移字段的方案：参数回填、字段保留（经 normalizePlan 规整）
+ui.applyPlan({
+  name: '爬移载入', rows: 1, cols: 2, labels: {},
+  steps: [{ axis: 'v', line: 1, dir: 'r' }],
+  creepCompensation: {
+    params: { paperThickness: 0.25, bleed: 2.5 },
+    spineAxis: 'vertical', spineSide: 'left', maxCompensation: 0.25,
+    faces: { '0,0': { front: 0, back: 0, axis: 'x', creep: 0 },
+             '1,0': { front: 0.25, back: -0.25, axis: 'x', creep: 0.25 } },
+    basis: { rows: 1, cols: 2, stepsSignature: 'old' },
+    appliedAt: '2026-09-22T00:00:00Z'
+  }
+}, null);
+assert.ok(ui.plan.creepCompensation);
+assert.equal(els.creepThickness.value, '0.25');
+assert.equal(els.creepBleed.value, '2.5');
+assert.equal(ui.plan.creepCompensation.faces['1,0'].front, 0.25);
 
 console.log('前端冒烟流程全部通过');

@@ -230,6 +230,44 @@ button.fold { flex: 1 1 40%; min-width: 110px; font-weight: 600; }
 .impose-status-err { color: var(--danger); }
 .impose-status-ok { color: var(--ok); }
 
+/* ---------- 书帖爬移补偿 ---------- */
+.creep-status-err { color: var(--danger); }
+.creep-status-ok { color: var(--ok); }
+.creep-summary {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink);
+  background: #f4f7fc;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 9px;
+}
+.creep-applied {
+  margin-top: 8px;
+  background: #ecfdf3;
+  border: 1px solid #9ad8b3;
+  color: #14532d;
+  border-radius: 6px;
+  padding: 7px 9px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.creep-applied.stale {
+  background: #fff7e6;
+  border-color: #e8cf94;
+  color: #7a5210;
+}
+.creep-table-wrap { margin-top: 10px; max-height: 300px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+.creep-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.creep-table th, .creep-table td { padding: 4px 8px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+.creep-table th { position: sticky; top: 0; background: #f4f7fc; color: var(--muted); font-weight: 600; z-index: 1; }
+.creep-table td.num, .creep-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.creep-table tr.creep-over td { background: #fff3f2; }
+.creep-table tr.creep-over td.creep-off { color: var(--danger); font-weight: 700; }
+.creep-table tr.leaf-cover td:first-child, .creep-table tr.leaf-center td:first-child { font-weight: 700; }
+.creep-axis { color: var(--muted); font-weight: 400; }
+
 /* ---------- 折手自动寻路 ---------- */
 .path-status-err { color: var(--danger); }
 .path-status-ok { color: var(--ok); }

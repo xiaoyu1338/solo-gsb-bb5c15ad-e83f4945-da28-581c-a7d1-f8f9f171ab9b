@@ -20,7 +20,8 @@ const app = {
   pathfind: { result: null, sig: null, gridKey: null },      // 折手自动寻路状态
   track: { result: null, gridKey: null, target: null },  // 面片轨迹
   duplex: { eligible: null, open: false, flip: 'long', result: null, sig: null },  // 双面印刷版
-  audit: { result: null }                   // 生产质量审计（只读，随方案变化自动重算）
+  audit: { result: null },                  // 生产质量审计（只读，随方案变化自动重算）
+  creep: { eligible: null, result: null }   // 书帖爬移补偿（实时重算，应用后写入独立字段）
 };
 
 const $ = (id) => document.getElementById(id);
@@ -83,6 +84,11 @@ function init() {
   });
 
   $('auditExportBtn').addEventListener('click', exportAudit);
+
+  $('creepThickness').addEventListener('input', renderCreep);
+  $('creepBleed').addEventListener('input', renderCreep);
+  $('creepApplyBtn').addEventListener('click', applyCreep);
+  $('creepClearBtn').addEventListener('click', clearCreep);
 
   canvas.addEventListener('click', onCanvasClick);
   canvas.addEventListener('mousemove', onCanvasMove);
@@ -222,6 +228,7 @@ function render() {
   renderTrack();
   renderDuplex();
   renderAudit();
+  renderCreep();
 }
 
 function renderControls() {
@@ -1331,6 +1338,204 @@ function renderPlateSheet(sheetEl, plate, result) {
   sheetEl.parentElement?.appendChild(edge);
 }
 
+// ---------- 书帖爬移补偿 ----------
+/**
+ * 卡片始终基于“全部步骤回放末态”实时重算（与回放停在第几步无关），
+ * 网格、折叠步骤或参数（纸厚/出血）变化后 render() 自动调用。
+ * 应用（“应用补偿”）后才把参数与逐面偏移写入 plan.creepCompensation 独立字段。
+ */
+function creepBasisSignature() {
+  return JSON.stringify({ r: app.plan.rows, c: app.plan.cols, s: app.plan.steps });
+}
+
+function fmtNum(n) {
+  return String(Math.round(n * 1000) / 1000);
+}
+
+/** 用当前末态 + 输入参数计算爬移补偿（参数非法时给出引擎错误对象）。 */
+function computeCreep() {
+  const t = Number($('creepThickness').value);
+  const b = Number($('creepBleed').value);
+  return {
+    t, b,
+    result: E.creepCompensation(
+      app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps, t, b)
+  };
+}
+
+/** 已应用方案与当前几何/参数是否仍一致（current 为非法结果时只判几何签名）。 */
+function creepSchemeStale(scheme, result) {
+  if (!scheme) return false;
+  if (scheme.basis && scheme.basis.stepsSignature !== creepBasisSignature()) return true;
+  if (!result) return true;
+  const p = scheme.params || {};
+  return Number(p.paperThickness) !== result.paperThickness || Number(p.bleed) !== result.bleed;
+}
+
+function renderCreep() {
+  const btn = $('creepApplyBtn');
+  const clearBtn = $('creepClearBtn');
+  const status = $('creepStatus');
+  const summary = $('creepSummary');
+  const appliedBox = $('creepApplied');
+  const wrap = $('creepTableWrap');
+  const tbody = $('creepRows');
+  const scheme = app.plan.creepCompensation || null;
+  clearBtn.hidden = !scheme;
+
+  if (!app.plan.rows) {
+    app.creep.eligible = null;
+    app.creep.result = null;
+    btn.disabled = true;
+    status.className = 'hint';
+    status.textContent = '先在左侧创建行列纸格并完成折叠。';
+    summary.hidden = true;
+    appliedBox.hidden = true;
+    wrap.hidden = true;
+    tbody.innerHTML = '';
+    return;
+  }
+
+  const { result } = computeCreep();
+  app.creep.result = result;
+
+  if (!result.ok) {
+    app.creep.eligible = result;
+    btn.disabled = true;
+    status.className = 'hint creep-status-err';
+    if (result.code === 'bad_thickness' || result.code === 'bad_bleed') {
+      status.textContent = '禁用应用：' + result.message;
+    } else if (result.code === 'not_single_stack') {
+      status.textContent = `禁用应用：尚未收成单叠（${result.message}）`;
+    } else {
+      status.textContent = `禁用应用：存在非法折叠${
+        result.stepIndex != null ? `（第 ${result.stepIndex + 1} 步）` : ''}：${result.message}`;
+    }
+    summary.hidden = true;
+    wrap.hidden = true;
+    tbody.innerHTML = '';
+    renderCreepApplied(scheme, null);
+    return;
+  }
+
+  app.creep.eligible = { ok: true };
+  renderCreepTable(result);
+  renderCreepSummary(result);
+  btn.disabled = !result.canApply;
+  status.className = 'hint ' + (result.canApply ? 'creep-status-ok' : 'creep-status-err');
+  if (result.canApply) {
+    status.textContent = `可应用：最大补偿 ${fmtNum(result.maxCompensation)}（${
+      result.leafCount} 叶），所有偏移均在可用出血 ${fmtNum(result.bleed)} 以内。`;
+  } else {
+    status.textContent =
+      `禁用应用：${result.overBleedCount} 个面的偏移绝对值超过可用出血 ${fmtNum(result.bleed)}` +
+      '（下表红色行），请加大出血或改用更薄纸张。';
+  }
+  renderCreepApplied(scheme, result);
+}
+
+function renderCreepSummary(result) {
+  const box = $('creepSummary');
+  const spineName = { left: '左缘（竖折脊）', right: '右缘（竖折脊）', top: '上缘（横折脊）', bottom: '下缘（横折脊）' }[result.spineSide];
+  box.hidden = false;
+  box.innerHTML =
+    `书脊位置：<b>${spineName || '未折叠（无书脊）'}</b>；内容沿前口→书脊方向逐叶内移。` +
+    `共 <b>${result.leafCount}</b> 叶，最外叶补偿 0，<b>最大补偿 = 纸厚 ${
+      fmtNum(result.paperThickness)} × ${Math.max(0, result.leafCount - 1)} = ${
+      fmtNum(result.maxCompensation)}</b>。偏移单位与输入一致（如 mm）。`;
+}
+
+function renderCreepTable(result) {
+  const wrap = $('creepTableWrap');
+  const tbody = $('creepRows');
+  wrap.hidden = false;
+  tbody.innerHTML = '';
+  result.leaves.forEach((lf) => {
+    const over = lf.front.overBleed || lf.back.overBleed;
+    const tr = document.createElement('tr');
+    tr.className = (over ? 'creep-over ' : '')
+      + (lf.leafIndex === 0 ? 'leaf-cover' : '')
+      + (lf.leafIndex === result.leaves.length - 1 ? ' leaf-center' : '');
+
+    const layerName = lf.leafIndex === 0 ? `${lf.leafIndex}（最外叶·封面）`
+      : lf.leafIndex === result.leaves.length - 1 ? `${lf.leafIndex}（最内叶·中缝）`
+      : String(lf.leafIndex);
+    const axisName = lf.axis === 'x' ? '横' : '纵';
+    const faceCell = (f) => {
+      const sign = f.offset > 0 ? '+' : '';
+      return `<span title="${f.dx === 0 ? '' : '原格 dx=' + fmtNum(f.dx) + '；'}${f.dy === 0 ? '' : '原格 dy=' + fmtNum(f.dy)}">` +
+        `${sign}${fmtNum(f.offset)} <span class="creep-axis">${axisName}</span>${f.overBleed ? ' ⚠超出血' : ''}</span>`;
+    };
+    tr.innerHTML =
+      `<td>${layerName}</td>` +
+      `<td>格(${lf.origin})</td>` +
+      `<td class="num">${lf.outsideCount}</td>` +
+      `<td class="num">${fmtNum(lf.creep)}</td>` +
+      `<td class="num creep-off">${faceCell(lf.front)}</td>` +
+      `<td class="num creep-off">${faceCell(lf.back)}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+/** 已应用方案提示：保留时显示参数与状态；几何/参数已变时标黄提示需重新应用。 */
+function renderCreepApplied(scheme, current) {
+  const box = $('creepApplied');
+  if (!scheme) {
+    box.hidden = true;
+    box.textContent = '';
+    return;
+  }
+  box.hidden = false;
+  const stale = creepSchemeStale(scheme, current);
+  box.className = 'creep-applied' + (stale ? ' stale' : '');
+  const faceCount = Object.keys(scheme.faces || {}).length;
+  box.innerHTML = stale
+    ? `⚠ 已应用的爬移补偿（纸厚 ${scheme.params.paperThickness}、出血 ${scheme.params.bleed}，` +
+      `${faceCount} 个原始纸格）与当前网格/步骤/参数不一致：字段仍随方案保留，` +
+      '请在参数修正后重新“应用补偿”，或“清除已应用”。'
+    : `✓ 已应用爬移补偿：纸厚 ${scheme.params.paperThickness}、出血 ${scheme.params.bleed}，` +
+      `最大补偿 ${scheme.maxCompensation != null ? scheme.maxCompensation : '—'}，` +
+      `逐面偏移已写入方案独立字段（${faceCount} 个原始纸格），保存/导入/服务端载入均保留。`;
+}
+
+/** 应用：把当前参数与逐面偏移固化到 plan.creepCompensation 独立字段。 */
+function applyCreep() {
+  const { result } = computeCreep();
+  if (!result.ok || !result.canApply) return;
+  const faces = {};
+  for (const lf of result.leaves) {
+    faces[lf.origin] = {
+      front: lf.front.offset,
+      back: lf.back.offset,
+      axis: lf.axis,
+      creep: lf.creep
+    };
+  }
+  app.plan.creepCompensation = {
+    params: { paperThickness: result.paperThickness, bleed: result.bleed },
+    spineAxis: result.spineAxis,
+    spineSide: result.spineSide,
+    maxCompensation: result.maxCompensation,
+    faces,
+    basis: {
+      rows: result.rows,
+      cols: result.cols,
+      stepsSignature: creepBasisSignature()
+    },
+    appliedAt: new Date().toISOString()
+  };
+  renderCreep();
+  $('saveMsg').textContent =
+    `已应用书帖爬移补偿（${result.leaves.length} 叶，最大补偿 ${fmtNum(result.maxCompensation)}），记得保存方案。`;
+}
+
+/** 清除已应用字段（实时明细表仍按当前参数展示）。 */
+function clearCreep() {
+  delete app.plan.creepCompensation;
+  renderCreep();
+  $('saveMsg').textContent = '已清除爬移补偿独立字段（需保存方案后生效）。';
+}
+
 // ---------- 生产质量审计 ----------
 /**
  * 渲染审计卡片：始终对“全部步骤”完整重放（与回放停在第几步无关），
@@ -1455,13 +1660,16 @@ function clearFoldError() { $('foldError').hidden = true; }
 
 // ---------- 存取 ----------
 function planPayload() {
-  return {
+  const p = {
     name: $('planName').value || '未命名方案',
     rows: app.plan.rows,
     cols: app.plan.cols,
     labels: app.plan.labels,
     steps: app.plan.steps
   };
+  // 爬移补偿独立方案字段：应用后随保存/导出保留
+  if (app.plan.creepCompensation) p.creepCompensation = app.plan.creepCompensation;
+  return p;
 }
 
 function applyPlan(plan, id) {
@@ -1471,6 +1679,11 @@ function applyPlan(plan, id) {
   $('planName').value = p.name;
   $('rowsInput').value = p.rows;
   $('colsInput').value = p.cols;
+  // 载入已应用的爬移补偿方案：回填参数输入框（逐面偏移在独立字段中保留）
+  if (p.creepCompensation && p.creepCompensation.params) {
+    $('creepThickness').value = p.creepCompensation.params.paperThickness;
+    $('creepBleed').value = p.creepCompensation.params.bleed;
+  }
   refreshLineSelect();
   setUpto(p.steps.length, true);
   $('deletePlanBtn').hidden = !id;
@@ -1565,10 +1778,12 @@ init();
 if (typeof window !== 'undefined') {
   window.__foldApp = Object.assign(app, {
     requestStep, setUpto, createGrid, render, getFoldError: () => $('foldError'),
+    applyPlan, planPayload,
     previewImposition, confirmImposition, closeImposition, renderImposition,
     readImposeInputs, runPathfind, doPathfindSearch, appendPathSolution, renderPathfind,
     renderTrack, refreshTrackCells, jumpTrackPoint, currentTrackInfo,
     openDuplex, closeDuplex, renderDuplex, renderDuplexPreview,
+    renderCreep, computeCreep, applyCreep, clearCreep, creepSchemeStale,
     renderAudit, exportAudit
   });
 }

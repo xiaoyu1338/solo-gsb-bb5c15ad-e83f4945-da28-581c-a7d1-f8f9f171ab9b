@@ -454,3 +454,131 @@ test('POST /api/audit：方案非法返回 400 bad_plan', async () => {
   assert.equal(r.status, 400);
   assert.equal(r.json.error.code, 'bad_plan');
 });
+
+// ---------- 书帖爬移补偿 ----------
+test('POST /api/creep-compensation：合法折帖返回逐叶偏移、书脊与最大补偿', async () => {
+  const r = await post('/api/creep-compensation', {
+    rows: 2, cols: 2, labels: {}, steps: STEPS, paperThickness: 0.1, bleed: 3
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.leafCount, 4);
+  assert.equal(r.json.maxCompensation, 0.3);
+  assert.equal(r.json.spineAxis, 'horizontal');
+  assert.equal(r.json.spineSide, 'top');
+  assert.equal(r.json.canApply, true);
+  assert.equal(r.json.overBleedCount, 0);
+  assert.deepEqual(r.json.leaves.map((l) => l.creep), [0, 0.1, 0.2, 0.3]);
+  // 每叶正反两面偏移齐全，绝对值等于补偿量；横折脊两面纵向偏移相同
+  for (const lf of r.json.leaves) {
+    assert.equal(lf.axis, 'y');
+    assert.equal(Math.abs(lf.front.offset), lf.creep);
+    assert.equal(lf.front.offset, lf.back.offset);
+    assert.match(lf.origin, /^\d+,\d+$/);
+  }
+});
+
+test('POST /api/creep-compensation：竖折脊正/反面横向偏移符号相反', async () => {
+  const r = await post('/api/creep-compensation', {
+    rows: 1, cols: 2, labels: {},
+    steps: [{ axis: 'v', line: 1, dir: 'r' }],
+    paperThickness: 0.2, bleed: 1
+  });
+  assert.equal(r.json.spineAxis, 'vertical');
+  assert.equal(r.json.spineSide, 'left');
+  assert.equal(r.json.maxCompensation, 0.2);
+  const inner = r.json.leaves[1];
+  assert.equal(inner.axis, 'x');
+  assert.equal(inner.front.offset, -inner.back.offset);
+  assert.equal(Math.abs(inner.front.offset), 0.2);
+});
+
+test('POST /api/creep-compensation：超出血时 canApply=false 并标红对应面', async () => {
+  const r = await post('/api/creep-compensation', {
+    rows: 1, cols: 2, labels: {},
+    steps: [{ axis: 'v', line: 1, dir: 'r' }],
+    paperThickness: 0.1, bleed: 0.05
+  });
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.canApply, false);
+  assert.equal(r.json.overBleedCount, 2);
+  assert.equal(r.json.leaves[1].front.overBleed, true);
+  assert.equal(r.json.leaves[1].back.overBleed, true);
+  assert.equal(r.json.leaves[0].front.overBleed, false);
+});
+
+test('POST /api/creep-compensation：非单叠/非法折/坏参数返回具体原因', async () => {
+  let r = await post('/api/creep-compensation', {
+    rows: 2, cols: 3, labels: {},
+    steps: [{ axis: 'v', line: 1, dir: 'r' }], paperThickness: 0.1, bleed: 3
+  });
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.error.code, 'not_single_stack');
+
+  r = await post('/api/creep-compensation', {
+    rows: 1, cols: 3, labels: {},
+    steps: [
+      { axis: 'v', line: 1, dir: 'r' },
+      { axis: 'v', line: 2, dir: 'l' }
+    ],
+    paperThickness: 0.1, bleed: 3
+  });
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.error.code, 'thickness');
+  assert.equal(r.json.error.stepIndex, 1);
+
+  r = await post('/api/creep-compensation', {
+    rows: 1, cols: 2, labels: {},
+    steps: [{ axis: 'v', line: 1, dir: 'r' }],
+    paperThickness: -1, bleed: 3
+  });
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.error.code, 'bad_thickness');
+
+  r = await post('/api/creep-compensation', {
+    rows: 1, cols: 2, labels: {},
+    steps: [{ axis: 'v', line: 1, dir: 'r' }],
+    paperThickness: 0.1, bleed: null
+  });
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.error.code, 'bad_bleed');
+});
+
+test('爬移补偿方案经保存/载入往返后独立字段完整保留', async () => {
+  const calc = await post('/api/creep-compensation', {
+    rows: 1, cols: 2, labels: {},
+    steps: [{ axis: 'v', line: 1, dir: 'r' }],
+    paperThickness: 0.1, bleed: 3
+  });
+  assert.equal(calc.json.ok, true);
+  const faces = {};
+  for (const lf of calc.json.leaves) {
+    faces[lf.origin] = { front: lf.front.offset, back: lf.back.offset, axis: lf.axis, creep: lf.creep };
+  }
+  const scheme = {
+    params: { paperThickness: 0.1, bleed: 3 },
+    spineAxis: calc.json.spineAxis,
+    spineSide: calc.json.spineSide,
+    maxCompensation: calc.json.maxCompensation,
+    faces,
+    basis: { rows: 1, cols: 2, stepsSignature: 'sig' },
+    appliedAt: '2026-09-22T00:00:00Z'
+  };
+  const saved = await post('/api/plans', {
+    name: '爬移存档', rows: 1, cols: 2, labels: {},
+    steps: [{ axis: 'v', line: 1, dir: 'r' }],
+    creepCompensation: scheme
+  });
+  assert.equal(saved.json.ok, true);
+  const loaded = await (await fetch(`${base}/api/plans/${saved.json.id}`)).json();
+  assert.deepEqual(loaded.creepCompensation, scheme);
+
+  // 非法爬移字段不影响方案保存（被规整丢弃）
+  const savedBad = await post('/api/plans', {
+    name: '坏爬移', rows: 1, cols: 2, labels: {}, steps: [],
+    creepCompensation: { params: { paperThickness: -1, bleed: 3 }, faces: {} }
+  });
+  assert.equal(savedBad.json.ok, true);
+  const loadedBad = await (await fetch(`${base}/api/plans/${savedBad.json.id}`)).json();
+  assert.equal(loadedBad.creepCompensation, undefined);
+});

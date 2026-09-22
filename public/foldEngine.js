@@ -539,6 +539,195 @@ function buildDuplexPlates(rows, cols, labels, steps, flip) {
 }
 
 /**
+ * 书帖爬移补偿（creep / shingling compensation）
+ * ------------------------------------------------
+ * 折帖收成骑马钉式单叠后，内层叶被外层叶包裹：前口（fore-edge）一侧
+ * 内层叶逐叶向外“爬出”。成品裁切后为让各叶内容相对前口对齐，需把内层
+ * 叶内容沿“前口 → 书脊”方向逐叶内移：
+ *
+ *   以最外叶（叠顶，封面叶）为第 0 层；某叶补偿量
+ *     creep(i) = paperThickness × i
+ *   （i = 该叶外侧叶数，即叠内自上而下的层序）。
+ *
+ * 书脊由<b>最后一步折叠</b>的折线确定（末折即装订脊折）：
+ *   axis='v' dir='r' 终叠位于折线右侧 → 书脊在终叠左缘，移动方向为世界 −x；
+ *   axis='v' dir='l' 终叠位于折线左侧 → 书脊在终叠右缘，移动方向为世界 +x；
+ *   axis='h' dir='d' 终叠位于折线下侧 → 书脊在终叠上缘，移动方向为世界 −y；
+ *   axis='h' dir='u' 终叠位于折线上侧 → 书脊在终叠下缘，移动方向为世界 +y。
+ *
+ * 世界内移量经各叶末态标架换算回原始纸格坐标（标架为正交反射，
+ * 平面分量点积即逆映射）：
+ *   Lx = W·frame.x，Ly = W·frame.y
+ * 正面版坐标 = 原始纸格坐标；反面按长边翻面排版惯例左右镜像
+ * （与双面印刷版一致），故反面版偏移 U = (−Lx, Ly)。
+ * 每个叶恰有一个分量非零（axis: 'x' 横向 / 'y' 纵向），其带符号值即
+ * “原始纸格正/反面的带符号横向（面内）偏移”。
+ *
+ * 偏移绝对值超过可用出血时该面 overBleed=true，方案不可应用。
+ *
+ * 前置条件与自动拼版/双面版相同：网格合法 + 全部步骤合法 + 收成单叠。
+ */
+
+/** 爬移补偿前置条件：复用 impositionEligibility（合法全步回放 + 单叠）。 */
+function creepEligibility(rows, cols, labels, steps) {
+  return impositionEligibility(rows, cols, labels, steps);
+}
+
+/**
+ * 计算逐叶爬移补偿。
+ * @param paperThickness 纸张厚度（与出血同单位，≥0 有限数）
+ * @param bleed 可用出血（≥0 有限数）
+ * @returns 成功
+ *   { ok:true, rows, cols, paperThickness, bleed, leafCount, capacity,
+ *     spineAxis:'vertical'|'horizontal'|'none', spineSide:'left'|'right'|'top'|'bottom'|null,
+ *     worldDir:{x,y}, maxCompensation, overBleedCount, canApply,
+ *     leaves:[{ leafIndex, outsideCount, panelId, origin, creep, axis:'x'|'y',
+ *               front:{offset, dx, dy, overBleed},
+ *               back:{offset, dx, dy, overBleed} }] }
+ *   前置失败透传 eligibility 的 { ok:false, code, ... }；
+ *   参数非法 { ok:false, code:'bad_thickness'|'bad_bleed', message }。
+ */
+function creepCompensation(rows, cols, labels, steps, paperThickness, bleed) {
+  const elig = impositionEligibility(rows, cols, labels, steps);
+  if (!elig.ok) return elig;
+
+  const t = Number(paperThickness);
+  if (paperThickness == null || !Number.isFinite(t) || t < 0) {
+    return { ok: false, code: 'bad_thickness',
+      message: '纸张厚度须为不小于 0 的数字（与出血同单位，如 mm）。', capacity: elig.capacity };
+  }
+  const b = Number(bleed);
+  if (bleed == null || !Number.isFinite(b) || b < 0) {
+    return { ok: false, code: 'bad_bleed',
+      message: '可用出血须为不小于 0 的数字（与纸厚同单位，如 mm）。', capacity: elig.capacity };
+  }
+
+  const list = Array.isArray(steps) ? steps : [];
+  const last = list.length ? list[list.length - 1] : null;
+  let spineAxis = 'none';
+  let spineSide = null;
+  let worldDir = { x: 0, y: 0 };
+  if (last) {
+    if (last.axis === 'v') {
+      spineAxis = 'vertical';
+      // dir='r' 左瓣折向右 → 终叠在右、书脊在左；dir='l' 反之
+      spineSide = last.dir === 'r' ? 'left' : 'right';
+      worldDir = last.dir === 'r' ? { x: -1, y: 0 } : { x: 1, y: 0 };
+    } else {
+      spineAxis = 'horizontal';
+      spineSide = last.dir === 'd' ? 'top' : 'bottom';
+      worldDir = last.dir === 'd' ? { x: 0, y: -1 } : { x: 0, y: 1 };
+    }
+  }
+
+  const grp = elig.info.stacks[0];
+  const panels = elig.state.panels;
+  const outLeaves = [];
+  let overBleedLeaves = 0;
+  grp.leaves.forEach((leaf, i) => {
+    const p = panels[leaf.panelId];
+    const creep = roundNum(t * i);
+    // 世界移动向量 W = worldDir × creep，经标架逆映射到原始纸格平面坐标
+    const wx = worldDir.x * creep;
+    const wy = worldDir.y * creep;
+    const lx = roundNum(dot2(wx, wy, p.frame.x));
+    const ly = roundNum(dot2(wx, wy, p.frame.y));
+    // 承载轴由书脊方向决定（竖折脊 -> 面内横向 x，横折脊 -> 纵向 y；
+    // 未折叠时退化取 x），零补偿叶也保持一致
+    const axis = spineAxis === 'horizontal' ? 'y' : 'x';
+    // 同一叶正/反两面承载同一物理内移量，|offset| 相同（反面版 x 镜像）
+    const over = (axis === 'x' ? Math.abs(lx) : Math.abs(ly)) > b + 1e-9;
+    if (over) overBleedLeaves++;
+    const faceView = (dx, dy) => ({ offset: axis === 'x' ? dx : dy, dx, dy, overBleed: over });
+    outLeaves.push({
+      leafIndex: i,
+      outsideCount: i,
+      panelId: leaf.panelId,
+      origin: leaf.panelId,
+      creep,
+      axis,
+      front: faceView(lx, ly),
+      back: faceView(roundNum(-lx), ly)
+    });
+  });
+
+  return {
+    ok: true,
+    rows, cols,
+    paperThickness: t,
+    bleed: b,
+    capacity: elig.capacity,
+    leafCount: outLeaves.length,
+    spineAxis,
+    spineSide,
+    worldDir,
+    maxCompensation: roundNum(t * Math.max(0, outLeaves.length - 1)),
+    overBleedLeaves,
+    overBleedCount: overBleedLeaves * 2,   // 每叶正、反两面同超限
+    canApply: overBleedLeaves === 0,
+    leaves: outLeaves
+  };
+}
+
+function dot2(wx, wy, v) {
+  return wx * (v.x || 0) + wy * (v.y || 0);
+}
+function roundNum(n) {
+  return Math.abs(n) < 1e-9 ? 0 : Math.round(n * 1e6) / 1e6;
+}
+
+/**
+ * 规整已应用的爬移补偿方案字段（载入 JSON / 存档时使用）。
+ * 与 normalizePlan 的严格抛错不同：该字段为附加独立方案，结构非法时
+ * 整体丢弃（返回 null），不影响方案其余部分载入。
+ * @param raw plan.creepCompensation
+ */
+function normalizeCreepScheme(raw, rows, cols) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const rawT = raw.params && raw.params.paperThickness;
+  const rawB = raw.params && raw.params.bleed;
+  const t = Number(rawT);
+  const b = Number(rawB);
+  if (rawT == null || rawB == null || !Number.isFinite(t) || t < 0
+      || !Number.isFinite(b) || b < 0) return null;
+  if (!raw.faces || typeof raw.faces !== 'object' || Array.isArray(raw.faces)) return null;
+  const faces = {};
+  for (const [k, v] of Object.entries(raw.faces)) {
+    const m = /^(\d+),(\d+)$/.exec(k);
+    if (!m || !v || typeof v !== 'object') continue;
+    const x = Number(m[1]), y = Number(m[2]);
+    if (x < 0 || x >= cols || y < 0 || y >= rows) continue;
+    const fo = Number(v.front), bo = Number(v.back);
+    if (!Number.isFinite(fo) || !Number.isFinite(bo)) continue;
+    const face = { front: roundNum(fo), back: roundNum(bo) };
+    if (v.axis === 'x' || v.axis === 'y') face.axis = v.axis;
+    if (Number.isFinite(Number(v.creep)) && Number(v.creep) >= 0) {
+      face.creep = roundNum(Number(v.creep));
+    }
+    faces[k] = face;
+  }
+  const out = { params: { paperThickness: t, bleed: b }, faces };
+  if (raw.basis && typeof raw.basis === 'object') {
+    const br = Number(raw.basis.rows), bc = Number(raw.basis.cols);
+    if (Number.isInteger(br) && br > 0 && Number.isInteger(bc) && bc > 0
+        && typeof raw.basis.stepsSignature === 'string') {
+      out.basis = { rows: br, cols: bc, stepsSignature: raw.basis.stepsSignature };
+    }
+  }
+  if (raw.spineAxis === 'vertical' || raw.spineAxis === 'horizontal' || raw.spineAxis === 'none') {
+    out.spineAxis = raw.spineAxis;
+  }
+  if (['left', 'right', 'top', 'bottom'].includes(raw.spineSide)) {
+    out.spineSide = raw.spineSide;
+  }
+  if (Number.isFinite(Number(raw.maxCompensation)) && Number(raw.maxCompensation) >= 0) {
+    out.maxCompensation = roundNum(Number(raw.maxCompensation));
+  }
+  if (typeof raw.appliedAt === 'string') out.appliedAt = raw.appliedAt;
+  return out;
+}
+
+/**
  * 汇总“现有标注 → 自动拼版结果”之间会被覆盖/清空的位置。
  * @returns [{ cell, face, from:string, to:string, blanked:boolean }]
  *   仅包含现有标注非空、且写入后内容发生变化的面。
@@ -1080,10 +1269,15 @@ function normalizePlan(plan) {
     e.errors = errors;
     throw e;
   }
-  return {
+  const normalized = {
     name: plan.name ? String(plan.name) : '未命名方案',
     rows, cols, labels, steps
   };
+  // 爬移补偿为独立方案字段：结构合法则保留（随方案保存/导入/服务端载入），
+  // 非法则静默丢弃，不影响方案其余部分。
+  const creep = normalizeCreepScheme(plan.creepCompensation, rows, cols);
+  if (creep) normalized.creepCompensation = creep;
+  return normalized;
 }
 
 const api = {
@@ -1091,6 +1285,7 @@ const api = {
   replay, visibleFace, pageSequence, normalizePlan, key,
   impositionEligibility, autoImpose, impositionOverwrite,
   duplexEligibility, buildDuplexPlates,
+  creepEligibility, creepCompensation, normalizeCreepScheme,
   findFoldPath, candidateSteps, stateKey, describeStep,
   trackPanel, auditPlan
 };

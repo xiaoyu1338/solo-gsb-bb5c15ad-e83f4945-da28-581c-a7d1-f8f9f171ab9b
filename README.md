@@ -16,6 +16,11 @@
 技术栈：Node.js + Express（服务端），原生 HTML / CSS / Canvas（前端），
 折叠模拟为一份零依赖的纯逻辑引擎，浏览器与服务端共用同一份代码。
 
+> **书帖爬移补偿**（新增）：收成单叠后输入纸张厚度与可用出血，按
+> “补偿量 = 纸厚 × 外侧叶数”逐叶计算前口→书脊的内移量，并换算为
+> 原始纸格正/反面的带符号横向偏移；超出血的面标红禁用，应用后参数与
+> 逐面偏移写入方案的独立字段 `creepCompensation`（保存/导入/服务端载入均保留）。
+
 ---
 
 ## 一条命令启动
@@ -128,7 +133,24 @@ docker compose down
        纸张 A4（或与纸格比例相近的横向纸）；
      - 应用已内置打印样式：**自动隐藏全部编辑控件，正面版、背面版各占一页**
        （A4 横版），无需在打印对话框中再做隐藏设置。
-11. **保存 / 载入**：
+11. **书帖爬移补偿**：右侧“书帖爬移补偿”卡片在**全部折叠步骤合法且收成单叠**后可用：
+    - 输入**纸张厚度**与**可用出血**（同单位，如 mm）；系统以**最外叶（封面叶）
+      为第 0 层**，某叶补偿量 = 纸厚 × 其外侧叶数，沿该页**前口 → 书脊**方向
+      移动内容，再依据面片末态朝向换算为**原始纸格正/反面的带符号横向偏移**
+      （反面按长边翻面排版惯例左右镜像，正/反符号相反；横折脊时承载轴为纵向、正反相同）；
+    - 书脊由**最后一步折叠**的折线确定（末折即装订脊折），卡片给出书脊位置、
+      **逐叶明细表**（层序、原始纸格、外侧叶数、补偿量、正/反面偏移）与**最大补偿**
+      （纸厚 × (叶数−1)，最内叶）；
+    - 任一面偏移**绝对值超过可用出血**时，该原始纸格对应面在表中**标红**并
+      **禁用“应用补偿”**（等于出血为界内，纸厚 0 或出血 0 都可正常计算）；
+    - 点击“应用补偿”后，参数与**逐面偏移**写入方案的**独立方案字段
+      `creepCompensation`**（含参数、书脊、最大补偿、逐格逐面偏移与几何基线签名），
+      **保存到服务器、导出/导入 JSON、服务端载入均原样保留**；“清除已应用”删除该字段；
+    - 网格、折叠步骤或参数变化后明细**自动重算**；已应用方案与当前几何/参数
+      不一致时保留字段并**标黄提示需重新应用**，不会静默改写；
+    - 方案含**非法折叠**或**尚未收成单叠**时卡片禁用并说明原因（未折叠的 1×1
+      单叠可计算，补偿全为 0）。
+12. **保存 / 载入**：
    - “保存到服务器”将方案 JSON 存入容器数据卷，可通过“已存方案…”再次载入；
    - “导出 JSON / 导入 JSON”在本地文件与应用之间交换方案。
 
@@ -154,6 +176,28 @@ docker compose down
 - `line=k` 表示第 `k-1` 与第 `k` 列（或行）之间的网格线（`1 ≤ k < 列/行数`）；
 - `dir` 为纸瓣落向：竖线用 `l` / `r`，横线用 `u` / `d`。
 
+应用过爬移补偿的方案还会带独立字段 `creepCompensation`（不应用则缺省）：
+
+```json
+{
+  "params": { "paperThickness": 0.1, "bleed": 3 },
+  "spineAxis": "vertical",
+  "spineSide": "left",
+  "maxCompensation": 0.3,
+  "faces": {
+    "0,0": { "front": 0, "back": 0, "axis": "x", "creep": 0 },
+    "1,0": { "front": -0.1, "back": 0.1, "axis": "x", "creep": 0.1 }
+  },
+  "basis": { "rows": 1, "cols": 2, "stepsSignature": "…" },
+  "appliedAt": "2026-09-22T00:00:00.000Z"
+}
+```
+
+- `faces` 以原始纸格为键，给出该格正/反面在各自印版视图中的带符号横向偏移
+  （正数=面向右/下移，负数=向左/上移）、承载轴 `axis`（`x` 横 / `y` 纵）与该叶补偿量；
+- `basis.stepsSignature` 为应用时的网格+折叠步骤签名，载入后用于识别方案是否已过期；
+- 载入时该字段仅做结构规整（非法静默丢弃），不影响方案其余部分。
+
 ---
 
 ## 折叠模型
@@ -171,20 +215,21 @@ docker compose down
 ## 目录结构
 
 ```
-server.js              Express 服务：静态托管 + /api/simulate + /api/impose + /api/duplex-plate + /api/find-path + /api/trajectory + /api/audit + 方案持久化
+server.js              Express 服务：静态托管 + /api/simulate + /api/impose + /api/duplex-plate + /api/find-path + /api/trajectory + /api/audit + /api/creep-compensation + 方案持久化
 entrypoint.sh          容器启动入口（依赖自检/安装、初始化、启动）
 public/
   index.html           页面结构
-  styles.css           样式（含面片轨迹时间线、审计卡片与双面版打印样式 @media print）
-  foldEngine.js        折叠模拟引擎（浏览器与服务端共用，含面片轨迹 trackPanel、生产质量审计 auditPlan）
-  app.js               Canvas 渲染、交互、回放、面片轨迹、存取、双面印刷版预览、生产质量审计
+  styles.css           样式（含面片轨迹时间线、审计卡片、爬移补偿表与双面版打印样式 @media print）
+  foldEngine.js        折叠模拟引擎（浏览器与服务端共用，含面片轨迹 trackPanel、生产质量审计 auditPlan、书帖爬移补偿 creepCompensation）
+  app.js               Canvas 渲染、交互、回放、面片轨迹、存取、双面印刷版预览、生产质量审计、书帖爬移补偿
 tests/engine.test.js   引擎单元测试（node --test）
 tests/imposition.test.js 自动拼版单元测试
 tests/duplex.test.js   双面印刷版（镜像、制版旋转、前置条件）单元测试
 tests/pathfind.test.js 折手自动寻路（BFS、状态键、无解/超限）单元测试
 tests/trajectory.test.js 面片轨迹（身份追踪、层序/朝向、非法步中断、参数校验）单元测试
 tests/audit.test.js    生产质量审计（分级结论、空白/重复/倒置/未覆盖/容量、非法步中止）单元测试
-tests/api.test.js      /api/impose、/api/find-path、/api/trajectory、/api/audit、/api/simulate 与方案存取的 HTTP 测试
+tests/creep.test.js    书帖爬移补偿（层序、书脊方向、标架换算、出血标红、字段规整）单元测试
+tests/api.test.js      /api/impose、/api/find-path、/api/trajectory、/api/audit、/api/creep-compensation、/api/simulate 与方案存取的 HTTP 测试
 tests/ui-smoke.js      前端主流程冒烟（DOM 桩中加载 app.js，直接 `node tests/ui-smoke.js` 运行）
 Dockerfile, docker-compose.yml
 ```
@@ -250,6 +295,20 @@ node tests/ui-smoke.js   # 前端主流程冒烟（DOM 桩，独立运行）
 `interrupted:{stepIndex,code,message,conflicts}` 标明中断原因（`contour` / `thickness`）。
 目标原格越界或面别非法返回 `ok:false`，错误码 `bad_target`；网格非法为 `bad_grid`；
 方案 JSON 非法为 `bad_plan`（HTTP 400）。该接口只读，不改变保存 / 导入格式。
+
+`POST /api/creep-compensation` 在方案 JSON 之外附加 `paperThickness` 与 `bleed`，
+返回逐叶爬移补偿：`spineAxis`（`vertical` 竖折脊 / `horizontal` 横折脊 / `none` 未折叠）、
+`spineSide`（`left`/`right`/`top`/`bottom`，书脊在终叠的哪一边）、
+`worldDir`（前口→书脊的世界单位方向）、`maxCompensation`、`leafCount`、
+`canApply` 与 `overBleedCount`（超限面数，每叶正/反两面同时计数），以及
+`leaves` 逐叶明细：`leafIndex`（0=最外叶）、`outsideCount` 外侧叶数、
+`origin`/`panelId` 原始纸格、`creep` 该叶补偿量、`axis`（承载轴 `x`/`y`）、
+`front`/`back` 各含 `offset`（该面印版视图的带符号横向偏移）、
+`dx`/`dy`（原始纸格坐标下的面内分量；反面 dx 已按长边翻面镜像取负）与 `overBleed`。
+前置条件不满足时返回 `ok:false`，错误码复用
+`contour` / `thickness` / `not_single_stack` / `bad_grid`；
+参数非法为 `bad_thickness` / `bad_bleed`。该接口只读；应用后由客户端把参数与
+逐面偏移写入方案的 `creepCompensation` 独立字段，保存/导入/服务端载入均原样保留。
 
 `POST /api/audit`（body 同方案 JSON）对全部步骤完整重放后按印刷交付规则审计，
 返回 `ok:true` 与 `verdict`（`pass` 可发布 / `fail` 需修订，存在 error 级结果即 fail）、
