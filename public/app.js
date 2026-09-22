@@ -20,7 +20,8 @@ const app = {
   pathfind: { result: null, sig: null, gridKey: null },      // 折手自动寻路状态
   track: { result: null, gridKey: null, target: null },  // 面片轨迹
   duplex: { eligible: null, open: false, flip: 'long', result: null, sig: null },  // 双面印刷版
-  audit: { result: null }                   // 生产质量审计（只读，随方案变化自动重算）
+  audit: { result: null },                  // 生产质量审计（只读，随方案变化自动重算）
+  creep: { eligible: null, result: null, inputsKey: null }  // 书帖爬移补偿（实时重算）
 };
 
 const $ = (id) => document.getElementById(id);
@@ -84,6 +85,11 @@ function init() {
 
   $('auditExportBtn').addEventListener('click', exportAudit);
 
+  $('creepThickness').addEventListener('input', renderCreep);
+  $('creepBleed').addEventListener('input', renderCreep);
+  $('creepApplyBtn').addEventListener('click', applyCreepComp);
+  $('creepClearBtn').addEventListener('click', clearCreepComp);
+
   canvas.addEventListener('click', onCanvasClick);
   canvas.addEventListener('mousemove', onCanvasMove);
   canvas.addEventListener('mouseleave', () => { app.hoverHandle = null; draw(); });
@@ -97,7 +103,7 @@ function init() {
 function createGrid() {
   const rows = clampInt($('rowsInput').value, 1, 12, 2);
   const cols = clampInt($('colsInput').value, 1, 12, 2);
-  app.plan = { name: $('planName').value || '未命名方案', rows, cols, labels: {}, steps: [] };
+  app.plan = { name: $('planName').value || '未命名方案', rows, cols, labels: {}, steps: [], creepComp: null };
   app.loadedId = null;
   setUpto(0, true);
   refreshLineSelect();
@@ -173,6 +179,7 @@ function flashConflict(err) {
   renderSteps();
   renderImposition();
   renderPathfind();
+  renderCreep();
 }
 
 function truncateSteps() {
@@ -222,6 +229,7 @@ function render() {
   renderTrack();
   renderDuplex();
   renderAudit();
+  renderCreep();
 }
 
 function renderControls() {
@@ -1442,6 +1450,201 @@ function exportAudit() {
   $('saveMsg').textContent = '已导出生产质量审计报告 JSON。';
 }
 
+// ---------- 书帖爬移补偿 ----------
+/**
+ * 爬移补偿卡片：复用“全部步骤合法且收成单叠”的末态叠层顺序（叠顶=第 0 层），
+ * 输入参数后由引擎实时重算；网格、标注、折叠步骤或参数变化都自动重算。
+ * 应用结果写入 app.plan.creepComp 独立字段，保存 / 导入 / 服务端载入均保留。
+ */
+function creepInputs() {
+  return { thickness: Number($('creepThickness').value), bleed: Number($('creepBleed').value) };
+}
+
+/** 已应用补偿与“当前几何 + 当前参数”是否一致（不一致即需重新应用）。 */
+function creepAppliedStale(result) {
+  const c = app.plan.creepComp;
+  if (!c) return false;
+  if (!result) return true;   // 网格/折叠已变化到无法重算（非法或非单叠）
+  if (creepRound(c.thickness) !== creepRound(result.thickness)
+      || creepRound(c.bleed) !== creepRound(result.bleed)) return true;
+  const live = creepCanonical(result);
+  const saved = creepCanonical(c);
+  return saved !== live;
+}
+
+function creepRound(v) {
+  const n = Math.round(Number(v) * 1e6) / 1e6;
+  return n === 0 ? 0 : n;
+}
+
+/** 与引擎 faces 同序（原始行列行优先、正面在前）的逐面偏移规范串。 */
+function creepCanonical(data) {
+  const faces = (data && data.faces) || [];
+  return faces.map((f) => `${f.origin}:${f.face}=${creepRound(f.shift)}`).join('|');
+}
+
+function fmtNum(v) {
+  const n = creepRound(v);
+  return String(n === 0 ? 0 : n);
+}
+
+function renderCreep() {
+  const btn = $('creepApplyBtn');
+  const clearBtn = $('creepClearBtn');
+  const status = $('creepStatus');
+  const detail = $('creepDetail');
+  const appliedBox = $('creepApplied');
+
+  clearBtn.disabled = !app.plan.creepComp;
+
+  if (!app.plan.rows) {
+    app.creep.eligible = null;
+    app.creep.result = null;
+    btn.disabled = true;
+    status.className = 'hint';
+    status.textContent = '先在左侧创建行列纸格并完成折叠。';
+    detail.hidden = true;
+    appliedBox.hidden = true;
+    return;
+  }
+
+  const elig = E.creepCompEligibility(
+    app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps);
+  app.creep.eligible = elig;
+  if (!elig.ok) {
+    app.creep.result = null;
+    btn.disabled = true;
+    status.className = 'hint creep-status-err';
+    status.textContent = elig.code === 'not_single_stack'
+      ? `禁用补偿：尚未收成单叠（${elig.message}）`
+      : `禁用补偿：${elig.message}`;
+    detail.hidden = true;
+    renderCreepApplied(null);
+    return;
+  }
+
+  const { thickness, bleed } = creepInputs();
+  const result = E.computeCreepComp(
+    app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps, thickness, bleed);
+  renderCreepApplied(result.ok ? result : null);
+  if (!result.ok) {
+    app.creep.result = null;
+    btn.disabled = true;
+    status.className = 'hint creep-status-err';
+    status.textContent = result.code === 'bad_thickness'
+      ? '请输入不小于 0 的纸张厚度（毫米）。'
+      : '请输入不小于 0 的可用出血（毫米）。';
+    detail.hidden = true;
+    return;
+  }
+
+  app.creep.result = result;
+  detail.hidden = false;
+  $('creepAxisNote').textContent = result.spineAxis === 'x'
+    ? '横向（列方向）：爬移表现为横向偏移'
+    : '纵向（行方向）：本折法爬移沿纵向，各面横向偏移均为 0';
+  renderCreepTable(result);
+
+  btn.disabled = !result.canApply;
+  status.className = 'hint ' + (result.canApply ? 'creep-status-ok' : 'creep-status-err');
+  if (result.canApply) {
+    status.textContent =
+      `共 ${result.leafCount} 叶，最大补偿量 ${fmtNum(result.maxCompensation)} mm，` +
+      `最大横向偏移 |${fmtNum(result.maxAbsShift)}| mm ≤ 可用出血 ${fmtNum(result.bleed)} mm，可应用。`;
+  } else {
+    const cells = [...new Set(result.overBleed.map((o) =>
+      `格(${o.origin})·${o.face === 'front' ? '正面' : '反面'}`))];
+    status.textContent =
+      `有 ${result.overBleed.length} 个面偏移超出血（最大 |${fmtNum(result.maxAbsShift)}| mm > ${fmtNum(result.bleed)} mm）：` +
+      `${cells.join('、')}；已在明细表标红，请减小纸厚或加大出血。`;
+  }
+}
+
+/** 已应用补偿条：显示参数与是否仍与当前方案/参数一致（失效提示重新应用）。 */
+function renderCreepApplied(liveResult) {
+  const box = $('creepApplied');
+  const c = app.plan.creepComp;
+  if (!c) { box.hidden = true; box.textContent = ''; return; }
+  box.hidden = false;
+  const stale = creepAppliedStale(liveResult);
+  box.className = 'creep-applied' + (stale ? ' stale' : '');
+  const axisText = c.spineAxis === 'x' ? '横向' : '纵向';
+  box.innerHTML = stale
+    ? `⚠ 已应用的补偿（纸厚 ${fmtNum(c.thickness)} mm、出血 ${fmtNum(c.bleed)} mm，${axisText}爬移）` +
+      '与当前网格 / 折叠步骤 / 参数不一致：网格或折叠变化后需重新计算，请重新应用。'
+    : `✓ 已应用补偿：纸厚 ${fmtNum(c.thickness)} mm、可用出血 ${fmtNum(c.bleed)} mm，` +
+      `${axisText}爬移，逐面横向偏移已写入方案，保存 / 导入均保留。`;
+}
+
+function renderCreepTable(result) {
+  const summary = $('creepSummary');
+  if (!result.lastStep) {
+    summary.innerHTML =
+      '仅 1 片叶子、无折叠：最外叶即唯一叶，各面补偿量均为 0（不存在嵌套爬移）。';
+  } else {
+    const spineText = result.spineAxis === 'x'
+      ? (result.dir.x > 0 ? '指向 +x（向右）' : '指向 -x（向左）')
+      : (result.dir.y > 0 ? '指向 +y（向下）' : '指向 -y（向上）');
+    summary.innerHTML =
+      `最末折（${E.describeStep(result.lastStep)}）折口为书脊：前口→书脊方向 <b>${spineText}</b>；` +
+      `最大补偿量 <b>${fmtNum(result.maxCompensation)}</b> mm（最内第 ${result.leafCount - 1} 层），` +
+      `最大横向偏移 <b>|${fmtNum(result.maxAbsShift)}|</b> mm。`;
+  }
+
+  const overSet = new Set(result.overBleed.map((o) => `${o.origin}:${o.face}`));
+  const tbody = $('creepRows');
+  tbody.innerHTML = '';
+  result.leaves.forEach((l) => {
+    const fOver = overSet.has(`${l.origin}:front`);
+    const bOver = overSet.has(`${l.origin}:back`);
+    const tr = document.createElement('tr');
+    if (fOver || bOver) tr.className = 'creep-over';
+    const cell = (txt, cls) => {
+      const td = document.createElement('td');
+      if (cls) td.className = cls;
+      td.innerHTML = txt;
+      return td;
+    };
+    tr.appendChild(cell(String(l.layer)));
+    tr.appendChild(cell(`<span class="creep-cell-tag">原格(${l.origin})</span>`));
+    tr.appendChild(cell(String(l.outerLeaves)));
+    tr.appendChild(cell(fmtNum(l.compensation), 'num'));
+    tr.appendChild(cell(
+      (fOver ? '⛔ ' : '') + fmtNum(l.frontShift) + (fOver ? ' 超出血' : ''), 'num'));
+    tr.appendChild(cell(
+      (bOver ? '⛔ ' : '') + fmtNum(l.backShift) + (bOver ? ' 超出血' : ''), 'num'));
+    tbody.appendChild(tr);
+  });
+}
+
+/** 应用：仅在合法、单叠且无面超出血时把参数与逐面偏移写入独立方案字段。 */
+function applyCreepComp() {
+  const result = app.creep.result;
+  if (!result || !result.canApply) return;
+  app.plan.creepComp = {
+    thickness: creepRound(result.thickness),
+    bleed: creepRound(result.bleed),
+    spineAxis: result.spineAxis,
+    leaves: result.leaves.map((l) => ({
+      layer: l.layer, origin: l.origin, outerLeaves: l.outerLeaves,
+      compensation: l.compensation, frontShift: l.frontShift, backShift: l.backShift
+    })),
+    faces: result.faces.map((f) => ({
+      origin: f.origin, face: f.face, layer: f.layer, shift: f.shift
+    }))
+  };
+  $('saveMsg').textContent =
+    '已应用书帖爬移补偿（参数与逐面偏移写入方案），记得保存方案。';
+  renderCreep();
+}
+
+function clearCreepComp() {
+  if (!app.plan.creepComp) return;
+  app.plan.creepComp = null;
+  $('saveMsg').textContent = '已清除书帖爬移补偿方案字段。';
+  renderCreep();
+}
+
 // ---------- 错误提示 ----------
 function showFoldError(err) {
   const box = $('foldError');
@@ -1460,7 +1663,8 @@ function planPayload() {
     rows: app.plan.rows,
     cols: app.plan.cols,
     labels: app.plan.labels,
-    steps: app.plan.steps
+    steps: app.plan.steps,
+    creepComp: app.plan.creepComp || null
   };
 }
 
@@ -1472,6 +1676,9 @@ function applyPlan(plan, id) {
   $('rowsInput').value = p.rows;
   $('colsInput').value = p.cols;
   refreshLineSelect();
+  // 载入已应用的爬移补偿参数（无则恢复默认输入）
+  $('creepThickness').value = p.creepComp ? fmtNum(p.creepComp.thickness) : '0.10';
+  $('creepBleed').value = p.creepComp ? fmtNum(p.creepComp.bleed) : '3';
   setUpto(p.steps.length, true);
   $('deletePlanBtn').hidden = !id;
   $('saveMsg').textContent = id ? `已载入服务器存档 ${id}` : '已载入 JSON 文件';
@@ -1569,6 +1776,7 @@ if (typeof window !== 'undefined') {
     readImposeInputs, runPathfind, doPathfindSearch, appendPathSolution, renderPathfind,
     renderTrack, refreshTrackCells, jumpTrackPoint, currentTrackInfo,
     openDuplex, closeDuplex, renderDuplex, renderDuplexPreview,
-    renderAudit, exportAudit
+    renderAudit, exportAudit,
+    renderCreep, applyCreepComp, clearCreepComp, creepInputs, creepAppliedStale
   });
 }

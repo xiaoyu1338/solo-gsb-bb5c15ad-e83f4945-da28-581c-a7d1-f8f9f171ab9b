@@ -1041,6 +1041,198 @@ function auditPlan(rows, cols, labels, steps) {
   };
 }
 
+/**
+ * 书帖爬移补偿（creep / shingling）
+ * --------------------------------
+ * 骑马钉折帖中，内侧各叶因纸张厚度会沿“前口（fore-edge）”方向逐叶外爬，
+ * 裁切后内页版心相对外页偏出。补偿方法：把每一叶的内容沿
+ * “前口 → 书脊（spine）”方向内移
+ *
+ *   某叶补偿量 = 纸张厚度 × 其外侧叶数
+ *
+ * 复用“全部步骤合法且收成单叠”后的叠层顺序：叠顶（自上而下第 1 片）即
+ * 最外叶，定义为第 0 层；第 i 层外侧叶数恰为 i。
+ *
+ * 书脊边就是“收成单叠的最后一折”的折线（外叶包叶的那条折口），故世界
+ * 坐标中“前口 → 书脊”的单位方向 D 由最后一步决定（与移动瓣落下方向相反）：
+ *   dir='l'（右瓣向左落，折线在终叠右侧）→ D=(+1, 0)
+ *   dir='r'（左瓣向右落，折线在终叠左侧）→ D=(-1, 0)
+ *   dir='u'（下瓣向上落，折线在终叠底侧）→ D=(0,+1)
+ *   dir='d'（上瓣向下落，折线在终叠顶侧）→ D=(0,-1)
+ *
+ * 内容移动是折叠世界坐标内的位移；要在原始（未折）纸格上制版，须按各面片
+ * 末态朝向换算。竖直翻折只会令面片自身 x 标架反向（水平翻折不影响 x），故
+ * 原始纸格上的“带符号横向偏移”（沿原始列方向 +x 为正）为：
+ *   正面 shift = 补偿量 · D.x · frame.x.x
+ *   反面 shift = -补偿量 · D.x · frame.x.x   （反面排版的横向基准与正面相反）
+ * D.x=0（书脊沿原始纵向）时横向偏移恒为 0，爬移表现为纵向移动（dy 给出）。
+ *
+ * 偏移绝对值超过“可用出血”时，该原始纸格的该面无法仅靠出血吸收爬移，
+ * overBleed 列出这些格/面，canApply=false。
+ *
+ * 计算为只读纯函数，不改写 labels / steps；应用结果由调用方写入方案的
+ * 独立字段 creepComp。
+ */
+
+/** 爬移补偿前置条件，与自动拼版一致：网格合法 + 全部折叠合法 + 收成单叠。 */
+function creepCompEligibility(rows, cols, labels, steps) {
+  return impositionEligibility(rows, cols, labels, steps);
+}
+
+function creepRound(v) {
+  const n = Math.round(v * 1e6) / 1e6;   // 消除 0.1+0.2 类浮点尾数
+  return n === 0 ? 0 : n;                // 统一 -0 为 0，便于展示与严格比较
+}
+
+/**
+ * 计算爬移补偿。
+ * @param thickness 纸张厚度（与出血同单位，通常 mm；须为有限的非负数）
+ * @param bleed     可用出血（同单位；|横向偏移| 大于它即超出血）
+ * @returns 成功
+ *   { ok:true, rows, cols, thickness, bleed, capacity, leafCount,
+ *     lastStep, spineAxis:'x'|'y',
+ *     dir:{x,y},             // 前口→书脊单位方向（折叠世界坐标）
+ *     leaves:[{ layer, origin, panelId, outerLeaves, compensation,
+ *               dx, dy, frontShift, backShift }],   // layer 0 = 最外叶
+ *     faces:[{ origin, face:'front'|'back', layer, compensation, shift, overBleed }],
+ *     maxCompensation, maxAbsShift, overBleed:[...], canApply }
+ *   失败透传前置错误，或 { ok:false, code:'bad_thickness'|'bad_bleed' }。
+ */
+function computeCreepComp(rows, cols, labels, steps, thickness, bleed) {
+  const elig = impositionEligibility(rows, cols, labels, steps);
+  if (!elig.ok) return elig;
+
+  thickness = Number(thickness);
+  bleed = Number(bleed);
+  if (!Number.isFinite(thickness) || thickness < 0) {
+    return { ok: false, code: 'bad_thickness', message: '纸张厚度须为不小于 0 的数字。', capacity: elig.capacity };
+  }
+  if (!Number.isFinite(bleed) || bleed < 0) {
+    return { ok: false, code: 'bad_bleed', message: '可用出血须为不小于 0 的数字。', capacity: elig.capacity };
+  }
+
+  const list = Array.isArray(steps) ? steps : [];
+  const last = list[list.length - 1];
+  // 最后一步已由 replay 证明合法；D 与移动瓣落下方向相反（指向前口→书脊）
+  const dirByLast = {
+    l: { x: 1, y: 0 }, r: { x: -1, y: 0 },
+    u: { x: 0, y: 1 }, d: { x: 0, y: -1 }
+  };
+  const D = last ? dirByLast[last.dir] : { x: 0, y: 0 };
+
+  const state = elig.state;
+  const cell = Object.keys(state.stacks)[0];
+  const ids = state.stacks[cell];                 // 自上而下：index 0 = 最外叶
+  const leaves = [];
+  const faces = [];
+  const over = [];
+  let maxComp = 0, maxAbs = 0;
+
+  ids.forEach((id, layer) => {
+    const p = state.panels[id];
+    const origin = key(p.ox, p.oy);
+    const outerLeaves = layer;                    // 叠顶为第 0 层，外侧叶数即层序
+    const comp = creepRound(thickness * outerLeaves);
+    const dx = creepRound(comp * D.x);
+    const dy = creepRound(comp * D.y);
+    // 竖直翻折令 frame.x 反向；水平翻折不改 x。frame.x.x ∈ {+1,-1}
+    const sx = p.frame.x.x || 0;
+    const frontShift = creepRound(comp * D.x * sx);
+    const backShift = creepRound(-comp * D.x * sx);
+    leaves.push({
+      layer, origin, panelId: id, outerLeaves,
+      compensation: comp, dx, dy, frontShift, backShift
+    });
+    for (const face of ['front', 'back']) {
+      const shift = face === 'front' ? frontShift : backShift;
+      const isOver = Math.abs(shift) > bleed;
+      if (isOver) over.push({ origin, face, layer, shift });
+      if (Math.abs(shift) > maxAbs) maxAbs = Math.abs(shift);
+      faces.push({ origin, face, layer, compensation: comp, shift, overBleed: isOver });
+    }
+    if (comp > maxComp) maxComp = comp;
+  });
+
+  // faces 按原始行列（行优先）、正面在前排序，便于制版逐格对照
+  faces.sort((a, b) =>
+    a.origin.localeCompare(b.origin, undefined, { numeric: true })
+    || (a.face === b.face ? 0 : a.face === 'front' ? -1 : 1));
+
+  return {
+    ok: true,
+    rows: Number(rows), cols: Number(cols),
+    thickness, bleed,
+    capacity: elig.capacity,
+    leafCount: ids.length,
+    lastStep: last ? { axis: last.axis, line: last.line, dir: last.dir } : null,
+    spineAxis: D.x !== 0 ? 'x' : 'y',
+    dir: D,
+    leaves, faces,
+    maxCompensation: maxComp,
+    maxAbsShift: creepRound(maxAbs),
+    overBleed: over,
+    canApply: over.length === 0
+  };
+}
+
+/**
+ * 规整方案中的 creepComp 字段（保存/导入/服务端载入时使用）。
+ * 缺省返回 null；结构非法时抛错（由 normalizePlan 汇总为 bad_plan）。
+ */
+function normalizeCreepComp(comp) {
+  if (comp == null) return null;
+  if (typeof comp !== 'object' || Array.isArray(comp)) {
+    throw new Error('creepComp 必须为对象');
+  }
+  const errors = [];
+  const thickness = Number(comp.thickness);
+  const bleed = Number(comp.bleed);
+  if (!Number.isFinite(thickness) || thickness < 0) errors.push('creepComp.thickness 须为不小于 0 的数字');
+  if (!Number.isFinite(bleed) || bleed < 0) errors.push('creepComp.bleed 须为不小于 0 的数字');
+  const spineAxis = comp.spineAxis === 'y' ? 'y' : 'x';
+
+  const normLeaf = (v, i) => {
+    const m = /^(\d+),(\d+)$/.exec(String(v && v.origin));
+    if (!m) { errors.push(`creepComp.leaves[${i}].origin 非法`); return null; }
+    const layer = Number(v.layer);
+    const outerLeaves = Number(v.outerLeaves);
+    const compensation = Number(v.compensation);
+    const frontShift = Number(v.frontShift);
+    const backShift = Number(v.backShift);
+    if (!Number.isInteger(layer) || layer < 0) errors.push(`creepComp.leaves[${i}].layer 非法`);
+    if (!Number.isInteger(outerLeaves) || outerLeaves < 0) errors.push(`creepComp.leaves[${i}].outerLeaves 非法`);
+    if (!Number.isFinite(compensation) || compensation < 0) errors.push(`creepComp.leaves[${i}].compensation 非法`);
+    if (!Number.isFinite(frontShift) || !Number.isFinite(backShift)) errors.push(`creepComp.leaves[${i}] 横向偏移非法`);
+    if (errors.length) return null;
+    return {
+      layer, origin: `${Number(m[1])},${Number(m[2])}`, outerLeaves,
+      compensation, frontShift, backShift
+    };
+  };
+  const leaves = [];
+  if (comp.leaves != null) {
+    if (!Array.isArray(comp.leaves)) errors.push('creepComp.leaves 必须为数组');
+    else comp.leaves.forEach((v, i) => { const l = normLeaf(v, i); if (l) leaves.push(l); });
+  }
+  const faces = [];
+  if (comp.faces != null) {
+    if (!Array.isArray(comp.faces)) errors.push('creepComp.faces 必须为数组');
+    else comp.faces.forEach((v, i) => {
+      const m = /^(\d+),(\d+)$/.exec(String(v && v.origin));
+      const face = v && (v.face === 'front' || v.face === 'back') ? v.face : null;
+      const layer = Number(v && v.layer);
+      const shift = Number(v && v.shift);
+      if (!m) errors.push(`creepComp.faces[${i}].origin 非法`);
+      if (!face) errors.push(`creepComp.faces[${i}].face 须为 front/back`);
+      if (!Number.isInteger(layer) || layer < 0) errors.push(`creepComp.faces[${i}].layer 非法`);
+      if (!Number.isFinite(shift)) errors.push(`creepComp.faces[${i}].shift 非法`);
+      if (m && face) faces.push({ origin: `${Number(m[1])},${Number(m[2])}`, face, layer, shift });
+    });
+  }
+  if (errors.length) throw new Error('爬移补偿字段格式错误：\n - ' + errors.join('\n - '));
+  return { thickness, bleed, spineAxis, leaves, faces };
+}
+
 /** 方案校验/规整（载入 JSON 时使用） */
 function normalizePlan(plan) {
   const errors = [];
@@ -1082,17 +1274,19 @@ function normalizePlan(plan) {
   }
   return {
     name: plan.name ? String(plan.name) : '未命名方案',
-    rows, cols, labels, steps
+    rows, cols, labels, steps,
+    creepComp: normalizeCreepComp(plan.creepComp)
   };
 }
 
 const api = {
   initialState, cloneState, validateFold, applyFold,
-  replay, visibleFace, pageSequence, normalizePlan, key,
+  replay, visibleFace, pageSequence, normalizePlan, normalizeCreepComp, key,
   impositionEligibility, autoImpose, impositionOverwrite,
   duplexEligibility, buildDuplexPlates,
   findFoldPath, candidateSteps, stateKey, describeStep,
-  trackPanel, auditPlan
+  trackPanel, auditPlan,
+  creepCompEligibility, computeCreepComp
 };
 
 if (typeof module !== 'undefined' && module.exports) module.exports = api;

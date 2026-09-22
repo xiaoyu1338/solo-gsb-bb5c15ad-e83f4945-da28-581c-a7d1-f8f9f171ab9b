@@ -61,7 +61,10 @@ const ids = ['rowsInput', 'colsInput', 'createGridBtn', 'axisSelect', 'lineSelec
   'duplexOverlay', 'duplexFlipOverlay', 'duplexScreenNote', 'duplexPrintBtn',
   'duplexCloseBtn', 'plateFrontMeta', 'plateBackMeta', 'plateFrontSheet',
   'plateBackSheet',
-  'auditCard', 'auditVerdict', 'auditStatus', 'auditFindings', 'auditExportBtn'];
+  'auditCard', 'auditVerdict', 'auditStatus', 'auditFindings', 'auditExportBtn',
+  'creepCard', 'creepThickness', 'creepBleed', 'creepApplyBtn', 'creepClearBtn',
+  'creepStatus', 'creepApplied', 'creepDetail', 'creepSummary', 'creepRows',
+  'creepAxisNote'];
 const els = Object.fromEntries(ids.map((id) => [id, makeEl(id)]));
 els.rowsInput.value = '2';
 els.colsInput.value = '2';
@@ -69,6 +72,8 @@ els.planName.value = '冒烟方案';
 els.axisSelect.value = 'v';
 els.duplexFlip.value = 'long';
 els.duplexFlipOverlay.value = 'long';
+els.creepThickness.value = '0.10';
+els.creepBleed.value = '3';
 
 const foldBtns = ['l', 'r', 'u', 'd'].map((dir) => {
   const b = makeEl('fold-' + dir);
@@ -478,5 +483,144 @@ assert.equal(els.auditFindings.hidden, true, '中止时不展示结论列表');
 ui.plan.steps.pop();
 ui.render();
 assert.equal(ui.audit.result.ok, true);
+
+// ---------- 书帖爬移补偿 ----------
+// 未收成单叠时禁用并说明原因（2×3 只折一次）
+els.rowsInput.value = '2'; els.colsInput.value = '3';
+els.createGridBtn.dispatch('click');
+ui.requestStep({ axis: 'v', line: 1, dir: 'r' });
+assert.equal(els.creepApplyBtn.disabled, true);
+assert.ok(/尚未收成单叠/.test(els.creepStatus.textContent));
+assert.equal(els.creepDetail.hidden, true);
+
+// 非法折叠时禁用
+els.rowsInput.value = '1'; els.colsInput.value = '3';
+els.createGridBtn.dispatch('click');
+ui.plan.steps.push({ axis: 'v', line: 2, dir: 'l' });   // 厚度冲突
+ui.renderCreep();
+assert.equal(els.creepApplyBtn.disabled, true);
+assert.ok(/禁用补偿/.test(els.creepStatus.textContent));
+
+// 合法 1×4 平行折（line2 右折 + line3 左折）：逐叶补偿 0/0.1/0.2/0.3，
+// 正反两面带符号横向偏移，最大补偿 0.3 ≤ 出血 3 → 可应用
+els.rowsInput.value = '1'; els.colsInput.value = '4';
+els.createGridBtn.dispatch('click');
+ui.requestStep({ axis: 'v', line: 2, dir: 'r' });
+ui.requestStep({ axis: 'v', line: 3, dir: 'l' });
+assert.equal(els.creepApplyBtn.disabled, false);
+const cr = ui.creep.result;
+assert.ok(cr && cr.ok);
+assert.equal(cr.spineAxis, 'x');
+assert.deepEqual(cr.leaves.map((l) => l.compensation), [0, 0.1, 0.2, 0.3]);
+assert.equal(cr.maxCompensation, 0.3);
+assert.equal(cr.maxAbsShift, 0.3);
+assert.equal(cr.canApply, true);
+assert.equal(els.creepDetail.hidden, false);
+assert.ok(/最大补偿量 0.3/.test(els.creepStatus.textContent));
+// 逐面偏移：原格 0,0 层1（+0.1/-0.1）；1,0 层2（-0.2/+0.2）；2,0 层3（+0.3/-0.3）
+const leafOrigin = Object.fromEntries(cr.leaves.map((l) => [l.origin, l]));
+assert.equal(leafOrigin['0,0'].frontShift, 0.1);
+assert.equal(leafOrigin['0,0'].backShift, -0.1);
+assert.equal(leafOrigin['1,0'].frontShift, -0.2);
+assert.equal(leafOrigin['1,0'].backShift, 0.2);
+assert.equal(leafOrigin['2,0'].frontShift, 0.3);
+
+// 应用：写入独立方案字段，清除按钮可用
+els.creepApplyBtn.dispatch('click');
+assert.ok(ui.plan.creepComp, '应用后应写入 creepComp');
+assert.equal(ui.plan.creepComp.thickness, 0.1);
+assert.equal(ui.plan.creepComp.bleed, 3);
+assert.equal(ui.plan.creepComp.faces.length, 8);
+assert.equal(els.creepClearBtn.disabled, false);
+assert.ok(/已应用补偿/.test(els.creepApplied.textContent));
+assert.equal(ui.creepAppliedStale(cr), false);
+
+// 逐面条目带原始格与面别（保存载荷即由该字段构成，savePlan 读取 planPayload）
+assert.ok(ui.plan.creepComp.faces.every((f) =>
+  /^\d+,\d+$/.test(f.origin) && (f.face === 'front' || f.face === 'back')));
+
+// 改参数后已应用方案标记为失效（需重新应用）
+els.creepThickness.value = '0.2';
+els.creepThickness.dispatch('input');
+assert.equal(ui.creepAppliedStale(ui.creep.result), true);
+assert.ok(/重新应用/.test(els.creepApplied.textContent));
+els.creepThickness.value = '0.10';
+els.creepThickness.dispatch('input');
+assert.equal(ui.creepAppliedStale(ui.creep.result), false);
+
+// 网格/折叠变化后自动重算且旧应用失效（直接模拟：改坏成非单叠 → 明细隐藏、按钮禁用、已应用条提示失效）
+ui.plan.steps.pop();
+ui.renderCreep();
+assert.equal(els.creepApplyBtn.disabled, true);
+assert.equal(els.creepDetail.hidden, true);
+assert.equal(els.creepClearBtn.disabled, false, '已应用字段仍在，清除仍可用');
+assert.ok(/不一致/.test(els.creepApplied.textContent));
+
+// 清除：字段删除、按钮复位
+els.creepClearBtn.dispatch('click');
+assert.equal(ui.plan.creepComp, null);
+assert.equal(els.creepClearBtn.disabled, true);
+assert.equal(els.creepApplied.hidden, true);
+
+// 出血不足：超出血面标红（明细表出现 creep-over 行）且应用禁用
+ui.requestStep({ axis: 'v', line: 3, dir: 'l' });
+// 为明细渲染临时换一个能真正收集子节点的 createElement
+const miniEl = () => {
+  const el = {
+    className: '', _html: '', textContent: '', children: [],
+    appendChild(c) { el.children.push(c); el.textContent += c.textContent; }
+  };
+  Object.defineProperty(el, 'innerHTML', {
+    get() { return el._html; },
+    set(v) { el._html = String(v); el.textContent = String(v).replace(/<[^>]*>/g, ''); }
+  });
+  return el;
+};
+const origCreate = sandbox.document.createElement;
+sandbox.document.createElement = () => miniEl();
+const creepRows = [];
+els.creepRows.appendChild = (tr) => creepRows.push(tr);
+els.creepBleed.value = '0.05';
+els.creepBleed.dispatch('input');
+sandbox.document.createElement = origCreate;
+assert.equal(ui.creep.result.canApply, false);
+assert.equal(els.creepApplyBtn.disabled, true);
+assert.ok(ui.creep.result.overBleed.some((o) => o.origin === '2,0'));
+assert.ok(/超出血/.test(els.creepStatus.textContent));
+assert.equal(creepRows.length, 4, '逐叶明细 4 行');
+assert.ok(creepRows.some((tr) => /creep-over/.test(tr.className)), '存在标红行');
+assert.ok(creepRows.some((tr) => tr.textContent.includes('2,0')), '标红明细含原格 2,0');
+els.creepBleed.value = '3';
+els.creepBleed.dispatch('input');
+assert.equal(els.creepApplyBtn.disabled, false);
+
+// 直角折 2×2：书脊沿原始纵向，各面横向偏移恒 0，不超出血
+els.rowsInput.value = '2'; els.colsInput.value = '2';
+els.createGridBtn.dispatch('click');
+ui.requestStep({ axis: 'v', line: 1, dir: 'r' });
+ui.requestStep({ axis: 'h', line: 1, dir: 'd' });
+assert.equal(ui.creep.result.spineAxis, 'y');
+assert.equal(ui.creep.result.maxAbsShift, 0);
+assert.equal(ui.creep.result.maxCompensation, 0.3);
+assert.equal(els.creepApplyBtn.disabled, false);
+
+// 非法参数禁用应用
+els.creepThickness.value = '-1';
+els.creepThickness.dispatch('input');
+assert.equal(els.creepApplyBtn.disabled, true);
+assert.ok(/纸张厚度/.test(els.creepStatus.textContent));
+els.creepThickness.value = '0.10';
+els.creepThickness.dispatch('input');
+
+// 应用后经 normalizePlan 往返保留（等价于导入/服务端载入）
+els.creepApplyBtn.dispatch('click');
+const roundtrip = FE.normalizePlan({
+  name: '爬移存档', rows: 2, cols: 2, labels: {}, steps: ui.plan.steps,
+  creepComp: ui.plan.creepComp
+});
+assert.ok(roundtrip.creepComp);
+assert.equal(roundtrip.creepComp.thickness, 0.1);
+assert.deepEqual(roundtrip.creepComp.faces.map((f) => f.shift),
+  new Array(8).fill(0));
 
 console.log('前端冒烟流程全部通过');

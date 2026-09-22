@@ -454,3 +454,136 @@ test('POST /api/audit：方案非法返回 400 bad_plan', async () => {
   assert.equal(r.status, 400);
   assert.equal(r.json.error.code, 'bad_plan');
 });
+
+// ---------- 书帖爬移补偿 ----------
+test('POST /api/creep-comp：合法 1×4 折帖返回逐叶补偿与逐面带符号横向偏移', async () => {
+  const r = await post('/api/creep-comp', {
+    rows: 1, cols: 4, labels: {},
+    steps: [{ axis: 'v', line: 2, dir: 'r' }, { axis: 'v', line: 3, dir: 'l' }],
+    thickness: 0.1, bleed: 3
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.leafCount, 4);
+  assert.equal(r.json.spineAxis, 'x');
+  assert.deepEqual(r.json.dir, { x: 1, y: 0 });
+  assert.deepEqual(r.json.leaves.map((l) => l.compensation), [0, 0.1, 0.2, 0.3]);
+  assert.equal(r.json.maxCompensation, 0.3);
+  assert.equal(r.json.maxAbsShift, 0.3);
+  assert.equal(r.json.canApply, true);
+  assert.deepEqual(r.json.overBleed, []);
+  // 8 个面（4 格 × 正反），每个带原始格与面别
+  assert.equal(r.json.faces.length, 8);
+  assert.ok(r.json.faces.every((f) =>
+    /^\d+,\d+$/.test(f.origin) && (f.face === 'front' || f.face === 'back')));
+  const f20 = r.json.faces.filter((f) => f.origin === '2,0');
+  assert.deepEqual(f20.map((f) => [f.face, f.shift]).sort(),
+    [['back', -0.3], ['front', 0.3]]);
+});
+
+test('POST /api/creep-comp：偏移超出血时 canApply=false 并列出格/面', async () => {
+  const r = await post('/api/creep-comp', {
+    rows: 1, cols: 2, labels: {},
+    steps: [{ axis: 'v', line: 1, dir: 'r' }],
+    thickness: 0.1, bleed: 0.05
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.ok, true, '计算成功但 canApply=false');
+  assert.equal(r.json.canApply, false);
+  const keys = r.json.overBleed.map((o) => `${o.origin}:${o.face}`).sort();
+  assert.deepEqual(keys, ['1,0:back', '1,0:front']);
+});
+
+test('POST /api/creep-comp：非单叠 / 非法折叠 / 参数非法均返回具体原因', async () => {
+  let r = await post('/api/creep-comp', {
+    rows: 2, cols: 3, labels: {},
+    steps: [{ axis: 'v', line: 1, dir: 'r' }], thickness: 0.1, bleed: 3
+  });
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.error.code, 'not_single_stack');
+
+  r = await post('/api/creep-comp', {
+    rows: 1, cols: 3, labels: {},
+    steps: [
+      { axis: 'v', line: 1, dir: 'r' },
+      { axis: 'v', line: 2, dir: 'l' }
+    ],
+    thickness: 0.1, bleed: 3
+  });
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.error.code, 'thickness');
+  assert.equal(r.json.error.stepIndex, 1);
+
+  r = await post('/api/creep-comp', {
+    rows: 1, cols: 2, labels: {},
+    steps: [{ axis: 'v', line: 1, dir: 'r' }], thickness: -1, bleed: 3
+  });
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.error.code, 'bad_thickness');
+
+  r = await post('/api/creep-comp', {
+    rows: 1, cols: 2, labels: {},
+    steps: [{ axis: 'v', line: 1, dir: 'r' }], thickness: 0.1, bleed: 'x'
+  });
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.error.code, 'bad_bleed');
+});
+
+test('POST /api/creep-comp：直角折书脊沿纵向时横向偏移为 0', async () => {
+  const r = await post('/api/creep-comp', {
+    rows: 2, cols: 2, labels: {}, steps: STEPS, thickness: 0.1, bleed: 3
+  });
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.spineAxis, 'y');
+  assert.equal(r.json.maxAbsShift, 0);
+  assert.equal(r.json.maxCompensation, 0.3);
+  assert.ok(r.json.faces.every((f) => f.shift === 0));
+});
+
+test('爬移补偿：应用结果随方案保存/载入往返完整保留', async () => {
+  const calc = await post('/api/creep-comp', {
+    rows: 1, cols: 4, labels: {},
+    steps: [{ axis: 'v', line: 2, dir: 'r' }, { axis: 'v', line: 3, dir: 'l' }],
+    thickness: 0.1, bleed: 3
+  });
+  const creepComp = {
+    thickness: calc.json.thickness,
+    bleed: calc.json.bleed,
+    spineAxis: calc.json.spineAxis,
+    leaves: calc.json.leaves.map((l) => ({
+      layer: l.layer, origin: l.origin, outerLeaves: l.outerLeaves,
+      compensation: l.compensation, frontShift: l.frontShift, backShift: l.backShift
+    })),
+    faces: calc.json.faces.map((f) => ({ origin: f.origin, face: f.face, layer: f.layer, shift: f.shift }))
+  };
+  const saved = await post('/api/plans', {
+    name: '爬移存档', rows: 1, cols: 4, labels: {},
+    steps: [{ axis: 'v', line: 2, dir: 'r' }, { axis: 'v', line: 3, dir: 'l' }],
+    creepComp
+  });
+  assert.equal(saved.json.ok, true);
+  const loaded = await (await fetch(`${base}/api/plans/${saved.json.id}`)).json();
+  assert.ok(loaded.creepComp, '服务端载入保留 creepComp');
+  assert.equal(loaded.creepComp.thickness, 0.1);
+  assert.equal(loaded.creepComp.bleed, 3);
+  assert.equal(loaded.creepComp.spineAxis, 'x');
+  assert.deepEqual(loaded.creepComp.faces, creepComp.faces);
+
+  // 未带 creepComp 的旧方案载入后该字段为 null（兼容）
+  const legacy = await post('/api/plans', {
+    name: '旧方案', rows: 1, cols: 2, labels: {},
+    steps: [{ axis: 'v', line: 1, dir: 'r' }]
+  });
+  const loadedLegacy = await (await fetch(`${base}/api/plans/${legacy.json.id}`)).json();
+  assert.equal(loadedLegacy.creepComp, null);
+});
+
+test('爬移补偿：保存非法 creepComp 字段返回 400 bad_plan', async () => {
+  const r = await post('/api/plans', {
+    name: '坏爬移', rows: 1, cols: 2, labels: {},
+    steps: [{ axis: 'v', line: 1, dir: 'r' }],
+    creepComp: { thickness: -1, bleed: 3, leaves: [], faces: [] }
+  });
+  assert.equal(r.status, 400);
+  assert.equal(r.json.error.code, 'bad_plan');
+});

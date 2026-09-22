@@ -4,6 +4,7 @@
  *  - 静态托管 public/（原生 HTML/CSS/Canvas 前端）
  *  - /api/simulate：服务端重放方案（与浏览器共用同一份 foldEngine.js）
  *  - /api/audit：生产质量审计（只读，不改动方案）
+ *  - /api/creep-comp：书帖爬移补偿（逐叶补偿量与原始纸格正/反面带符号横向偏移）
  *  - /api/plans* ：方案 JSON 持久化到 DATA_DIR（容器卷）
  */
 const express = require('express');
@@ -191,6 +192,34 @@ app.post('/api/audit', (req, res) => {
   }
 });
 
+// ---------- 书帖爬移补偿 ----------
+app.post('/api/creep-comp', (req, res) => {
+  try {
+    const plan = E.normalizePlan(req.body || {});
+    const result = E.computeCreepComp(
+      plan.rows, plan.cols, plan.labels, plan.steps,
+      req.body && req.body.thickness,
+      req.body && req.body.bleed
+    );
+    if (!result.ok) {
+      return res.json({
+        ok: false,
+        error: {
+          code: result.code,
+          message: result.message,
+          capacity: result.capacity,
+          stepIndex: result.stepIndex,
+          conflicts: result.conflicts,
+          stackCount: result.stackCount
+        }
+      });
+    }
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ ok: false, error: { code: 'bad_plan', message: e.message } });
+  }
+});
+
 // ---------- 方案持久化 ----------
 function planFile(id) { return path.join(DATA_DIR, `${id}.json`); }
 
@@ -215,6 +244,7 @@ app.post('/api/plans', (req, res) => {
     const body = {
       name: plan.name, rows: plan.rows, cols: plan.cols,
       labels: plan.labels, steps: plan.steps,
+      creepComp: plan.creepComp,
       savedAt: new Date().toISOString()
     };
     let id = (req.body && typeof req.body.id === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(req.body.id))

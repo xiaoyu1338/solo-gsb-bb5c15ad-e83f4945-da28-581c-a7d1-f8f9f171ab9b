@@ -171,6 +171,40 @@
         <div id="duplexStatus" class="hint"></div>
       </section>
 
+      <section class="card" id="creepCard">
+        <h2>书帖爬移补偿</h2>
+        <p class="hint">全部折叠合法并收成单叠后，以<b>最外叶为第 0 层</b>逐叶计算爬移：
+          补偿量 = 纸张厚度 × 其外侧叶数，内容沿该页<b>前口指向书脊</b>方向内移，
+          并按各面片朝向换算为原始纸格正/反面的<b>带符号横向偏移</b>（沿原始列方向，+ 向右）。
+          偏移绝对值超过可用出血时对应格/面标红且不能应用；应用后参数与逐面偏移写入方案并随保存/导入保留。</p>
+        <div class="row">
+          <label>纸张厚度 (mm)
+            <input id="creepThickness" type="number" min="0" step="0.01" value="0.10" />
+          </label>
+          <label>可用出血 (mm)
+            <input id="creepBleed" type="number" min="0" step="0.1" value="3" />
+          </label>
+          <button id="creepApplyBtn" class="primary" disabled>应用补偿</button>
+          <button id="creepClearBtn" disabled>清除已应用</button>
+        </div>
+        <div id="creepStatus" class="hint"></div>
+        <div id="creepApplied" class="creep-applied" hidden></div>
+        <div id="creepDetail" class="creep-detail" hidden>
+          <div id="creepSummary" class="creep-summary"></div>
+          <div class="creep-table-wrap">
+            <table class="creep-table">
+              <thead>
+                <tr><th>层</th><th>原始纸格</th><th>外侧叶数</th><th>补偿量(mm)</th>
+                  <th>正面横向偏移(mm)</th><th>反面横向偏移(mm)</th></tr>
+              </thead>
+              <tbody id="creepRows"></tbody>
+            </table>
+          </div>
+          <p class="hint">书脊沿原始<span id="creepAxisNote"></span>；
+            偏移为正表示在该面制版时把内容沿原始列方向向右移、为负向左移（正反两面符号相反）。</p>
+        </div>
+      </section>
+
       <section class="card" id="pathfindCard">
         <h2>折手自动寻路</h2>
         <p class="hint">指定某个<b>原始纸格</b>的正面或反面作为最终朝上的封面，从当前方案的

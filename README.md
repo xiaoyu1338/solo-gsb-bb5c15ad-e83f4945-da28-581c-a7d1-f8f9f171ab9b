@@ -128,7 +128,26 @@ docker compose down
        纸张 A4（或与纸格比例相近的横向纸）；
      - 应用已内置打印样式：**自动隐藏全部编辑控件，正面版、背面版各占一页**
        （A4 横版），无需在打印对话框中再做隐藏设置。
-11. **保存 / 载入**：
+11. **书帖爬移补偿**：右侧“书帖爬移补偿”卡片中输入**纸张厚度**与**可用出血**
+    （毫米）：
+    - 复用“**全部步骤合法且收成单叠**”后的末态叠层顺序：叠顶即**最外叶，
+      定义为第 0 层**；某叶补偿量 = 纸厚 × 其外侧叶数（即层序），内容沿该页
+      **前口指向书脊**方向内移——书脊就是收成单叠的**最末折折口**；
+    - 按各面片末态朝向（竖直翻折使面片自身横向标架反向）换算为每个
+      **原始纸格正/反面的带符号横向偏移**（沿原始列方向，+ 向右；正、反两面
+      符号相反）；直角折等书脊沿原始纵向的折法，爬移表现为纵向移动、
+      各面横向偏移为 0（卡片会注明方向）；
+    - 卡片给出**逐叶明细**（层、原始纸格、外侧叶数、补偿量、正面/反面横向
+      偏移）与**最大补偿量 / 最大横向偏移**；任一偏移绝对值**超过可用出血**时，
+      对应原始纸格与面别在表中**标红**并汇总原因，“应用补偿”按钮禁用
+      （临界等值不算超出）；
+    - “**应用补偿**”把参数（纸厚、出血、书脊轴向）与**逐面偏移**写入方案的
+      **独立字段 `creepComp`**：保存到服务器、导出/导入 JSON、服务端载入均
+      原样保留；可随时“清除已应用”；
+    - 网格、折叠步骤或输入参数变化后**自动重算**；已应用补偿与当前几何/参数
+      不一致时给出“需重新应用”提示；**非法折叠或尚未收成单叠时整卡禁用**，
+      红字说明具体原因（不产出任何偏移）。
+12. **保存 / 载入**：
    - “保存到服务器”将方案 JSON 存入容器数据卷，可通过“已存方案…”再次载入；
    - “导出 JSON / 导入 JSON”在本地文件与应用之间交换方案。
 
@@ -145,14 +164,20 @@ docker compose down
   "steps": [
     { "axis": "v", "line": 1, "dir": "r" },
     { "axis": "h", "line": 1, "dir": "d" }
-  ]
+  ],
+  "creepComp": null
 }
 ```
 
 - `labels` 的键为 `列,行`（0 基），值为该格正反面页码字符串；
 - 步骤中 `axis`：`v` 竖直线 / `h` 水平线；
 - `line=k` 表示第 `k-1` 与第 `k` 列（或行）之间的网格线（`1 ≤ k < 列/行数`）；
-- `dir` 为纸瓣落向：竖线用 `l` / `r`，横线用 `u` / `d`。
+- `dir` 为纸瓣落向：竖线用 `l` / `r`，横线用 `u` / `d`；
+- `creepComp` 为“书帖爬移补偿”应用后的独立字段（未应用时为 `null`）：
+  `{ thickness, bleed, spineAxis:'x'|'y', leaves:[…], faces:[…] }`，
+  其中 `leaves` 逐叶给出 `layer`（最外叶为 0）、`origin`、`outerLeaves`、
+  `compensation`、`frontShift` / `backShift`（带符号横向偏移，毫米），
+  `faces` 逐面给出 `origin`、`face`（front/back）、`layer`、`shift`。
 
 ---
 
@@ -171,19 +196,20 @@ docker compose down
 ## 目录结构
 
 ```
-server.js              Express 服务：静态托管 + /api/simulate + /api/impose + /api/duplex-plate + /api/find-path + /api/trajectory + /api/audit + 方案持久化
+server.js              Express 服务：静态托管 + /api/simulate + /api/impose + /api/duplex-plate + /api/find-path + /api/trajectory + /api/audit + /api/creep-comp + 方案持久化
 entrypoint.sh          容器启动入口（依赖自检/安装、初始化、启动）
 public/
   index.html           页面结构
-  styles.css           样式（含面片轨迹时间线、审计卡片与双面版打印样式 @media print）
-  foldEngine.js        折叠模拟引擎（浏览器与服务端共用，含面片轨迹 trackPanel、生产质量审计 auditPlan）
-  app.js               Canvas 渲染、交互、回放、面片轨迹、存取、双面印刷版预览、生产质量审计
+  styles.css           样式（含面片轨迹时间线、审计卡片、爬移补偿明细与双面版打印样式 @media print）
+  foldEngine.js        折叠模拟引擎（浏览器与服务端共用，含面片轨迹 trackPanel、生产质量审计 auditPlan、书帖爬移补偿 computeCreepComp）
+  app.js               Canvas 渲染、交互、回放、面片轨迹、存取、双面印刷版预览、生产质量审计、书帖爬移补偿
 tests/engine.test.js   引擎单元测试（node --test）
 tests/imposition.test.js 自动拼版单元测试
 tests/duplex.test.js   双面印刷版（镜像、制版旋转、前置条件）单元测试
 tests/pathfind.test.js 折手自动寻路（BFS、状态键、无解/超限）单元测试
 tests/trajectory.test.js 面片轨迹（身份追踪、层序/朝向、非法步中断、参数校验）单元测试
 tests/audit.test.js    生产质量审计（分级结论、空白/重复/倒置/未覆盖/容量、非法步中止）单元测试
+tests/creep.test.js    书帖爬移补偿（层序/补偿量、书脊方向、正反面带符号偏移、超出血、字段往返）单元测试
 tests/api.test.js      /api/impose、/api/find-path、/api/trajectory、/api/audit、/api/simulate 与方案存取的 HTTP 测试
 tests/ui-smoke.js      前端主流程冒烟（DOM 桩中加载 app.js，直接 `node tests/ui-smoke.js` 运行）
 Dockerfile, docker-compose.yml
@@ -250,6 +276,20 @@ node tests/ui-smoke.js   # 前端主流程冒烟（DOM 桩，独立运行）
 `interrupted:{stepIndex,code,message,conflicts}` 标明中断原因（`contour` / `thickness`）。
 目标原格越界或面别非法返回 `ok:false`，错误码 `bad_target`；网格非法为 `bad_grid`；
 方案 JSON 非法为 `bad_plan`（HTTP 400）。该接口只读，不改变保存 / 导入格式。
+
+`POST /api/creep-comp` 在方案 JSON 之外附加 `thickness`（纸张厚度，毫米）与
+`bleed`（可用出血，毫米，均须为不小于 0 的数字），返回书帖爬移补偿：
+`leafCount`、`lastStep`（书脊折口）、`spineAxis`（`x` 横向 / `y` 纵向）、
+`dir`（前口→书脊单位方向）、`leaves`（逐叶 `layer` 最外叶为 0、`origin`、
+`outerLeaves`、`compensation`、`dx`/`dy` 世界坐标位移、`frontShift`/`backShift`
+原始纸格正/反面带符号横向偏移）、`faces`（逐面 `origin`/`face`/`layer`/`shift`/
+`overBleed`，按原始行列排序）、`maxCompensation`、`maxAbsShift`、
+`overBleed`（超出血面列表）与 `canApply`。前置条件不满足时返回 `ok:false`，
+错误码复用 `contour` / `thickness` / `not_single_stack` / `bad_grid`，
+纸厚或出血非法为 `bad_thickness` / `bad_bleed`。该接口只读；客户端把参数与
+逐面偏移写入方案独立字段 `creepComp` 后，保存（`POST /api/plans`）、
+导入与服务端载入（`GET /api/plans/:id`）均原样保留，字段结构非法随方案一并
+返回 `bad_plan`（HTTP 400）。
 
 `POST /api/audit`（body 同方案 JSON）对全部步骤完整重放后按印刷交付规则审计，
 返回 `ok:true` 与 `verdict`（`pass` 可发布 / `fail` 需修订，存在 error 级结果即 fail）、

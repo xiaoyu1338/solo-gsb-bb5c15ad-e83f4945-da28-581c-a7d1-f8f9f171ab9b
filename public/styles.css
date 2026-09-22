@@ -481,6 +481,43 @@ button.fold { flex: 1 1 40%; min-width: 110px; font-weight: 600; }
   font-variant-numeric: tabular-nums;
 }
 
+/* ---------- 书帖爬移补偿 ---------- */
+.creep-status-err { color: var(--danger); }
+.creep-status-ok { color: var(--ok); }
+.creep-applied {
+  margin-top: 8px;
+  background: #e3f6ec;
+  border: 1px solid #9fd8b8;
+  color: #14532d;
+  border-radius: 6px;
+  padding: 7px 9px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.creep-applied.stale {
+  background: #fdf0dc;
+  border-color: #e8a13c;
+  color: #7a5210;
+}
+.creep-detail { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 10px; }
+.creep-summary { font-size: 12px; color: var(--ink); line-height: 1.6; margin-bottom: 6px; }
+.creep-table-wrap { max-height: 280px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; margin-bottom: 6px; }
+.creep-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.creep-table th, .creep-table td { padding: 4px 8px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+.creep-table th { position: sticky; top: 0; background: #f4f7fc; color: var(--muted); font-weight: 600; z-index: 1; }
+.creep-table td.num, .creep-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.creep-table tr.creep-over { background: var(--warn-bg); }
+.creep-table tr.creep-over td { color: var(--danger); font-weight: 700; }
+.creep-table tr.creep-over .creep-cell-tag {
+  background: var(--danger);
+  color: #fff;
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.creep-cell-tag {
+  font-variant-numeric: tabular-nums;
+}
+
 @media (max-width: 1100px) {
   .layout { grid-template-columns: 1fr; }
 }
